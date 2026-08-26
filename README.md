@@ -15,15 +15,15 @@
 ---
 ## 🚀 News
 - **[2026-05-30]** : 支持lerobot0.5.2内置的10种模型与原版模型(lingbotvla, pi0, pi0fast, pi05, gr00tN1.7)
-- **[2026-06-13]** : 新增离线推理、异步推理与RTC
 - **[2026-07-09]** : 新增LingbotVLA-v2模型
+- **[2026-08-26]** : 我们推出[Kuavo-VLA-1.0](https://model.lejurobot.com/kuavo-vla-1), 一款基于Kuavo本体与工业场景的垂域大模型。使用方法见[完整文档](https://www.letools.lejurobot.com)
 ## ✨ 核心特性
 
 | 特性 | 说明 |
 |:---:|:---|
 | 📦 **数据转换** | Rosbag → LeRobot Dataset v3 格式 |
 | 🧠 **lerobot集成** | 模仿学习（ACT、DPT、Multi-task DIT）+ VLA（PI0、PI0_FAST、PI0.5、GR00T N1.5、WALL-X、XVLA、SmolVLA）|
-| 🔌 **外部模型** | Pi0 / Pi0.5 / GR00T N1.7 / LingbotVla / LingbotVla-v2 |
+| 🔌 **外部模型** | Pi0 / Pi0.5 / GR00T N1.7 / LingbotVla / LingbotVla-v2 / Kuavo-VLA-1.0|
 | 🚀 **仿真&真机** | Kuavo 仿真与真机部署评测流程 |
 | 🦾 **多平台支持** | Kuavo 4 Pro · Kuavo 5 · Kuavo 5W |
 

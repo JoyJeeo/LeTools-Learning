@@ -237,7 +237,7 @@ echo "==================================================="
 conda install ffmpeg=6.1.1 -y
 pip uninstall pyarrow -y
 pip install pyarrow==21.0.0
-conda install pyaudio -y
+conda install pyaudio=0.2.14 -y
 
 echo ""
 echo "==================================================="

@@ -11,11 +11,16 @@ import sys
 from kuavo_deploy.config import KuavoConfig
 from sensor_msgs.msg import CompressedImage, JointState
 from torchvision.transforms.functional import to_tensor
-from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import sensorsData,lejuClawState
+from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import sensorsData,lejuClawState,SG100HandState
 from kuavo_deploy.utils.signal_controller import ControlSignalManager
 from kuavo_deploy.utils.logging_utils import setup_logger
 from kuavo_deploy.utils.ros_manager import ROSManager
 from kuavo_data.common.config_platform import get_arm_joint_slice
+from kuavo_data.common.kuavo_dataset import SG100_JOINT_LIMITS
+
+_SG100_LO = np.array([lo for lo, _ in SG100_JOINT_LIMITS], dtype=np.float32)
+_SG100_HI = np.array([hi for _, hi in SG100_JOINT_LIMITS], dtype=np.float32)
+_SG100_RANGE = _SG100_HI - _SG100_LO
 
 log_robot = setup_logger("robot")
 
@@ -70,6 +75,7 @@ class ObsBuffer:
             '/dexhand/state': self.qiangnaoState_callback,
             '/leju_claw_state': self.lejuClawState_callback,
             '/gripper/state': self.rq2f85State_callback,
+            '/sg100_hand_state': self.sg100State_callback,
         }
         self.setup_subscribers()
 
@@ -82,7 +88,8 @@ class ObsBuffer:
         msg_type_dict = {"CompressedImage":CompressedImage,
                          "sensorsData":sensorsData,
                          "JointState":JointState,
-                         "lejuClawState":lejuClawState}
+                         "lejuClawState":lejuClawState,
+                         "SG100HandState":SG100HandState}
         for topic_key, info in self.subscribe_keys.items():
             topic_name = info["topic"]
             assert info["msg_type"] in msg_type_dict, f"msg_type '{info['msg_type']}' is not supported; valid keys: {list(msg_type_dict.keys())}"
@@ -181,6 +188,15 @@ class ObsBuffer:
         slice_value = handle.get("params", {}).get("slice", None)
         joint = [x for slc in slice_value for x in joint[slc[0]:slc[1]]]
         # joint = torch.tensor(joint, dtype=torch.float32, device=self.device)
+        self._append_data(key, joint, msg.header.stamp.to_sec())
+
+    def sg100State_callback(self, msg: SG100HandState, key: str, handle = dict):
+        # SG100 每关节限位方向不同，须按 kuavo_data 训练侧同一份 SG100_JOINT_LIMITS 做逐关节
+        # min-max 归一化，再按 which_arm 切片；顺序不能反，否则限位表索引会和实际关节错位。
+        joint = np.array(list(msg.left_hand_positions) + list(msg.right_hand_positions), dtype=np.float32)
+        joint = np.clip((joint - _SG100_LO) / _SG100_RANGE, 0.0, 1.0)
+        slice_value = handle.get("params", {}).get("slice", None)
+        joint = [x for slc in slice_value for x in joint[slc[0]:slc[1]]]
         self._append_data(key, joint, msg.header.stamp.to_sec())
 
     # ===== 公共方法 =====

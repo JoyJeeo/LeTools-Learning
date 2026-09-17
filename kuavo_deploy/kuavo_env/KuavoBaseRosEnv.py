@@ -8,7 +8,7 @@ import gymnasium as gym
 import time
 import sys
 from kuavo_humanoid_sdk import KuavoSDK, KuavoRobot, KuavoRobotState, DexterousHand
-from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import lejuClawCommand
+from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import lejuClawCommand, SG100HandCommand
 from kuavo_humanoid_sdk.msg.kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
 from kuavo_deploy.utils.logging_utils import setup_logger
 from kuavo_deploy.config import KuavoConfig
@@ -20,6 +20,7 @@ from kuavo_deploy.utils.obs_buffer import ObsBuffer
 from kuavo_deploy.utils.signal_controller import ControlSignalManager
 from kuavo_deploy.utils.lowpass_filter import LowPassFilter
 from std_srvs.srv import SetBool
+from kuavo_data.common.kuavo_dataset import SG100_SINGLE_HAND_JOINT_LIMITS
 
 log_robot = setup_logger("robot")
 
@@ -56,6 +57,7 @@ class KuavoBaseRosEnv(gym.Env):
         self.which_arm = config_kuavo_env.which_arm
         self.direct_to_wbc = config_kuavo_env.direct_to_wbc
         self.qiangnao_dof_needed = config_kuavo_env.qiangnao_dof_needed
+        self.eef_dof = 11 if self.eef_type == 'sg100' else 1  # 每只手末端执行器的自由度数
         self.control_rate_hz = getattr(config_kuavo_env, "control_rate", 100)
         self.enable_action_interpolation = getattr(config_kuavo_env, "enable_action_interpolation", True)
         self.interpolation_steps = (
@@ -149,23 +151,27 @@ class KuavoBaseRosEnv(gym.Env):
         def get_arm_action_range(arm: str):
             """返回 (low, high)"""
             if self.control_mode == 'joint':
+                d = self.eef_dof
+                eef_limits = limits['sg100'] if self.eef_type == 'sg100' else limits['gripper']
                 if arm == 'left':
                     return (
-                        limits['joint_q']['min'][:7] + limits['gripper']['min'][:1],
-                        limits['joint_q']['max'][:7] + limits['gripper']['max'][:1],
+                        limits['joint_q']['min'][:7] + eef_limits['min'][:d],
+                        limits['joint_q']['max'][:7] + eef_limits['max'][:d],
                     )
                 elif arm == 'right':
                     return (
-                        limits['joint_q']['min'][7:14] + limits['gripper']['min'][1:2],
-                        limits['joint_q']['max'][7:14] + limits['gripper']['max'][1:2],
+                        limits['joint_q']['min'][7:14] + eef_limits['min'][d:2 * d],
+                        limits['joint_q']['max'][7:14] + eef_limits['max'][d:2 * d],
                     )
                 elif arm == 'both':
                     return (
-                        limits['joint_q']['min'][:7] + limits['gripper']['min'][:1]+limits['joint_q']['min'][7:14] + limits['gripper']['min'][1:2],
-                        limits['joint_q']['max'][:7] + limits['gripper']['max'][:1]+limits['joint_q']['max'][7:14] + limits['gripper']['max'][1:2],
+                        limits['joint_q']['min'][:7] + eef_limits['min'][:d]+limits['joint_q']['min'][7:14] + eef_limits['min'][d:2 * d],
+                        limits['joint_q']['max'][:7] + eef_limits['max'][:d]+limits['joint_q']['max'][7:14] + eef_limits['max'][d:2 * d],
                     )
 
             elif self.control_mode == 'eef':
+                if self.eef_type == 'sg100':
+                    raise ValueError("control_mode='eef' 暂不支持 sg100（11自由度灵巧手），请使用 control_mode='joint'")
                 # key = 'eef_relative' if self.use_delta else 'eef'
                 key = 'eef'
                 inf_pad = [-np.inf] * 6
@@ -228,7 +234,9 @@ class KuavoBaseRosEnv(gym.Env):
             self.lejuclaw = LejuClaw()
         elif self.eef_type == 'qiangnao':
             self.qiangnao = DexterousHand()
-        # obs buffer 初始化            
+        elif self.eef_type == 'sg100':
+            self.sg100_hand = SG100Hand()
+        # obs buffer 初始化
         self.obs_buffer.wait_buffer_ready()
 
 
@@ -327,21 +335,30 @@ class KuavoBaseRosEnv(gym.Env):
     # 子函数 3. 末端执行器（夹爪）复位
     # ==========================================================
     def _reset_eef(self):
+        # SG100 复位到张开姿态（各关节限位下限）
+        sg100_open = [lo for lo, _ in SG100_SINGLE_HAND_JOINT_LIMITS]
+
         if self.which_arm == 'both':
             if self.eef_type == 'qiangnao':
                 self.qiangnao.control(target_positions=[0, 100, 0, 0, 0, 0, 0, 100, 0, 0, 0, 0], target_velocities=None, target_torques=None)
             elif self.eef_type == 'leju_claw':
                 self.lejuclaw.control(target_positions=[0, 0], target_velocities=None, target_torques=None)
+            elif self.eef_type == 'sg100':
+                self.sg100_hand.control(left_positions=sg100_open, right_positions=sg100_open)
         elif self.which_arm == 'left':
             if self.eef_type == 'qiangnao':
                 self.qiangnao.control_left(target_positions=[0, 100, 0, 0, 0, 0], target_velocities=None, target_torques=None)
             elif self.eef_type == 'leju_claw':
                 self.lejuclaw.control_left(target_positions=[0], target_velocities=None, target_torques=None)
+            elif self.eef_type == 'sg100':
+                self.sg100_hand.control(left_positions=sg100_open, right_positions=[0.0] * 11)
         elif self.which_arm == 'right':
             if self.eef_type == 'qiangnao':
                 self.qiangnao.control_right(target_positions=[0, 100, 0, 0, 0, 0], target_velocities=None, target_torques=None)
             elif self.eef_type == 'leju_claw':
                 self.lejuclaw.control_right(target_positions=[0], target_velocities=None, target_torques=None)
+            elif self.eef_type == 'sg100':
+                self.sg100_hand.control(left_positions=[0.0] * 11, right_positions=sg100_open)
         else:
             raise KeyError(f"Unsupported arm type: {self.which_arm}")
 
@@ -437,8 +454,9 @@ class KuavoBaseRosEnv(gym.Env):
 
         # === 4. 执行动作 ===
         t2 = time.time()
+        d = self.eef_dof
         if self.which_arm == 'both':
-            self.cur_joint_angles_action = np.concatenate((action[:7], action[8:15]), axis=0)
+            self.cur_joint_angles_action = np.concatenate((action[:7], action[7 + d:14 + d]), axis=0)
         elif self.which_arm == 'left':
             self.cur_joint_angles_action = np.concatenate((action[:7], self.arm_init[7:14]), axis=0)
         elif self.which_arm == 'right':
@@ -463,7 +481,7 @@ class KuavoBaseRosEnv(gym.Env):
 
                 # 构造目标 14 维关节（仅关节，不含夹爪），用于第一帧从 current_q 平滑过去
                 if self.which_arm == 'both':
-                    target_joints14 = np.concatenate((action[:7], action[8:15]), axis=0)
+                    target_joints14 = np.concatenate((action[:7], action[7 + d:14 + d]), axis=0)
                 elif self.which_arm == 'left':
                     target_joints14 = np.concatenate((action[:7], self.arm_init[7:14]), axis=0)
                 else:  # right
@@ -485,24 +503,24 @@ class KuavoBaseRosEnv(gym.Env):
 
                 # 夹爪目标值（不参与插值）：每个分支只声明自己真正会用到的那个
                 if self.which_arm == 'both':
-                    left_eef = action[7]
-                    right_eef = action[15]
+                    left_eef = action[7:7 + d]
+                    right_eef = action[14 + d:14 + 2 * d]
                 elif self.which_arm == 'left':
-                    left_eef = action[7]
+                    left_eef = action[7:7 + d]
                 else:  # right
-                    right_eef = action[7]
+                    right_eef = action[7:7 + d]
 
                 for i in range(num_inter_points):
                     alpha = (i + 1) / num_inter_points
                     inter_arm_action = (1 - alpha) * self.last_predicted_action + alpha * action
                     # 夹爪不参与插值，直接锁到目标值
                     if self.which_arm == 'both':
-                        inter_arm_action[7] = left_eef
-                        inter_arm_action[15] = right_eef
+                        inter_arm_action[7:7 + d] = left_eef
+                        inter_arm_action[14 + d:14 + 2 * d] = right_eef
                     elif self.which_arm == 'left':
-                        inter_arm_action[7] = left_eef
+                        inter_arm_action[7:7 + d] = left_eef
                     else:  # right
-                        inter_arm_action[7] = right_eef
+                        inter_arm_action[7:7 + d] = right_eef
 
                     self.exec_action(inter_arm_action)
                     self.control_rate.sleep()
@@ -545,24 +563,27 @@ class KuavoBaseRosEnv(gym.Env):
 
         if self.direct_to_wbc:
             action = self.low_pass_filter.update(action)
+        d = self.eef_dof
+        # d==1 时（非sg100末端）保持标量语义，与原有 _control_eef 逻辑（left_eef * 255 等）兼容
+        unwrap = (lambda x: x[0]) if d == 1 else (lambda x: x)
         if self.which_arm == 'both':
-            left_joints, left_eef = action[:7], action[7]
-            right_joints, right_eef = action[8:15], action[15]
+            left_joints, left_eef = action[:7], unwrap(action[7:7 + d])
+            right_joints, right_eef = action[7 + d:14 + d], unwrap(action[14 + d:14 + 2 * d])
             target_position = np.concatenate((left_joints, right_joints), axis=0)
             self.safe_control_arm(target_position)
             self._control_eef(left_eef, right_eef)
 
         elif self.which_arm == 'left':
-            left_joints, left_eef = action[:7], action[7]
+            left_joints, left_eef = action[:7], unwrap(action[7:7 + d])
             target_position = np.concatenate((left_joints, self.arm_init[7:14]), axis=0)
             self.safe_control_arm(target_position)
-            self._control_eef(left_eef, 0)
+            self._control_eef(left_eef, unwrap(np.zeros(d)))
 
         elif self.which_arm == 'right':
-            right_joints, right_eef = action[:7], action[7]
+            right_joints, right_eef = action[:7], unwrap(action[7:7 + d])
             target_position = np.concatenate((self.arm_init[:7], right_joints), axis=0)
             self.safe_control_arm(target_position)
-            self._control_eef(0, right_eef)
+            self._control_eef(unwrap(np.zeros(d)), right_eef)
         else:
             raise KeyError(f"Unsupported which_arm: {self.which_arm}")
 
@@ -594,6 +615,15 @@ class KuavoBaseRosEnv(gym.Env):
                 tem_right, 100, *([tem_right] * 4)
             ])
             self.qiangnao.control(target_positions=target_positions)
+
+        elif self.eef_type == 'sg100':
+            # 策略输出为 [0,1] 归一化值，需按训练侧同一份 SG100_SINGLE_HAND_JOINT_LIMITS 反归一化回弧度，
+            # 保证归一化口径与 kuavo_data 的数据转换（CvtRosbag2Lerobot.py）严格一致
+            sg100_lo = np.array([lo for lo, _ in SG100_SINGLE_HAND_JOINT_LIMITS], dtype=np.float32)
+            sg100_hi = np.array([hi for _, hi in SG100_SINGLE_HAND_JOINT_LIMITS], dtype=np.float32)
+            left_rad = sg100_lo + np.clip(np.asarray(left_eef, dtype=np.float32), 0.0, 1.0) * (sg100_hi - sg100_lo)
+            right_rad = sg100_lo + np.clip(np.asarray(right_eef, dtype=np.float32), 0.0, 1.0) * (sg100_hi - sg100_lo)
+            self.sg100_hand.control(left_positions=left_rad.tolist(), right_positions=right_rad.tolist())
 
         else:
             raise KeyError(f"Unsupported eef_type: {self.eef_type}")
@@ -748,6 +778,29 @@ class LejuClaw:
         if torques is None:
             return [1.0] * length
         return [max(0.0, min(10.0, torque)) for torque in torques]
+
+    def close(self):
+        """释放资源"""
+        if hasattr(self, 'ros_manager'):
+            self.ros_manager.close()
+
+
+class SG100Hand:
+    """SG100（黑曼灵巧手）控制器，每手11个关节，单位弧度"""
+    def __init__(self, ros_manager=None):
+        self.ros_manager = ros_manager or ROSManager()
+        self._pub_sg100_cmd = self.ros_manager.register_publisher('/sg100_hand_command', SG100HandCommand, queue_size=10)
+
+    def control(self, left_positions: list, right_positions: list):
+        """控制双手，left_positions/right_positions 均为长度11的弧度列表"""
+        assert len(left_positions) == 11, "left_positions must be a list of length 11"
+        assert len(right_positions) == 11, "right_positions must be a list of length 11"
+
+        cmd = SG100HandCommand()
+        cmd.control_mode = SG100HandCommand.MODE_POSITION
+        cmd.left_hand_positions = list(left_positions)
+        cmd.right_hand_positions = list(right_positions)
+        self._pub_sg100_cmd.publish(cmd)
 
     def close(self):
         """释放资源"""

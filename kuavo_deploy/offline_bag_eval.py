@@ -146,13 +146,19 @@ def _load_bag_frames(
         claw_action: np.ndarray,
         qiangnao_state: np.ndarray,
         qiangnao_action: np.ndarray,
+        sg100_state: np.ndarray,
+        sg100_action: np.ndarray,
         hand_side: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         robot_slice = kuavo.SLICE_ROBOT[hand_side]
         arm_state = state[robot_slice[0] : robot_slice[-1]]
         arm_action = action[robot_slice[0] : robot_slice[-1]]
 
-        if kuavo.USE_LEJU_CLAW:
+        if kuavo.USE_SG100:
+            sg100_slice = kuavo.SLICE_SG100[hand_side]
+            eef_state = sg100_state[sg100_slice[0] : sg100_slice[-1]]
+            eef_action = sg100_action[sg100_slice[0] : sg100_slice[-1]]
+        elif kuavo.USE_LEJU_CLAW:
             claw_slice = kuavo.SLICE_CLAW[hand_side]
             eef_state = claw_state[claw_slice[0] : claw_slice[-1]]
             eef_action = claw_action[claw_slice[0] : claw_slice[-1]]
@@ -161,7 +167,7 @@ def _load_bag_frames(
             eef_state = qiangnao_state[dex_slice[0] : dex_slice[-1]]
             eef_action = qiangnao_action[dex_slice[0] : dex_slice[-1]]
         else:
-            raise ValueError("Only leju_claw, rq2f85 and qiangnao end effectors are supported.")
+            raise ValueError("Only leju_claw, rq2f85, qiangnao and sg100 end effectors are supported.")
 
         return (
             np.concatenate((arm_state, eef_state)).astype(np.float32),
@@ -200,10 +206,12 @@ def _load_bag_frames(
         qiangnao_action = _array(aligned_frame, "action.qiangnao")
         rq2f85_state = _array(aligned_frame, "observation.rq2f85")
         rq2f85_action = _array(aligned_frame, "action.rq2f85")
+        sg100_state = _array(aligned_frame, "observation.sg100")
+        sg100_action = _array(aligned_frame, "action.sg100")
 
-        if claw_state.size == 0 and qiangnao_state.size == 0 and rq2f85_state.size == 0:
+        if claw_state.size == 0 and qiangnao_state.size == 0 and rq2f85_state.size == 0 and sg100_state.size == 0:
             return
-        if claw_action.size == 0 and qiangnao_action.size == 0 and rq2f85_action.size == 0:
+        if claw_action.size == 0 and qiangnao_action.size == 0 and rq2f85_action.size == 0 and sg100_action.size == 0:
             return
 
         claw_state = _normalize_binary_or_range(claw_state, binary_threshold=50, scale=100)
@@ -213,7 +221,18 @@ def _load_bag_frames(
         rq2f85_state = _normalize_binary_or_range(rq2f85_state, binary_threshold=0.4, scale=0.8)
         rq2f85_action = _normalize_binary_or_range(rq2f85_action, binary_threshold=70, scale=255)
 
-        if claw_state.size == 0 and qiangnao_state.size == 0:
+        if kuavo.USE_SG100:
+            # SG100 单位是弧度且每关节限位方向不同，须按逐关节 min-max 归一化，
+            # 与 CvtRosbag2Lerobot.py 训练侧保持完全一致的口径，不能套用 claw/qiangnao 的百分比逻辑
+            sg100_lo = np.array([lo for lo, _ in kuavo.SG100_JOINT_LIMITS], dtype=np.float32)
+            sg100_hi = np.array([hi for _, hi in kuavo.SG100_JOINT_LIMITS], dtype=np.float32)
+            sg100_range = sg100_hi - sg100_lo
+            if sg100_state.size:
+                sg100_state = np.clip((sg100_state - sg100_lo) / sg100_range, 0.0, 1.0).astype(np.float32)
+            if sg100_action.size:
+                sg100_action = np.clip((sg100_action - sg100_lo) / sg100_range, 0.0, 1.0).astype(np.float32)
+
+        if claw_state.size == 0 and qiangnao_state.size == 0 and sg100_state.size == 0:
             claw_state = rq2f85_state
             claw_action = rq2f85_action
 
@@ -227,6 +246,8 @@ def _load_bag_frames(
                 claw_action=claw_action,
                 qiangnao_state=qiangnao_state,
                 qiangnao_action=qiangnao_action,
+                sg100_state=sg100_state,
+                sg100_action=sg100_action,
                 hand_side=0,
             )
             state_parts.append(s)
@@ -239,6 +260,8 @@ def _load_bag_frames(
                 claw_action=claw_action,
                 qiangnao_state=qiangnao_state,
                 qiangnao_action=qiangnao_action,
+                sg100_state=sg100_state,
+                sg100_action=sg100_action,
                 hand_side=1,
             )
             state_parts.append(s)

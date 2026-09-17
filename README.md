@@ -159,6 +159,7 @@ inference:
 ```
 
 ```bash
+source <你的kuavo-ros-control工作空间路径>/devel/setup.bash  # kuavo_humanoid_sdk 1.4.5+ 起，需先 source 才能 import kuavo_msgs
 python kuavo_deploy/eval.py
 ```
 

@@ -21,6 +21,7 @@ env:  # 推理环境设置。
     rq2f85: ["/gripper/state", "JointState", 500]  # RQ2F85 topic。选这个夹爪时自动生效。
     leju_claw: ["/leju_claw_state", "lejuClawState", 500]  # Leju claw topic。选这个夹爪时自动生效。
     qiangnao: ["/dexhand/state", "JointState", 500]  # Qiangnao topic。选这个手型时自动生效。
+    sg100: ["/sg100_hand_state", "SG100HandState", 500]  # SG100（黑曼灵巧手）topic。选这个手型时自动生效。
   arm_state_keys: ["joint_q", "gripper"]  # 哪些状态会拼成 observation.state。
   ratio: 1.0  # 动作缩放比例。
   frame_alignment: false  # 是否做时间对齐。
@@ -39,6 +40,9 @@ env:  # 推理环境设置。
     base:  # 底盘控制上下限。
       min: [-2.0, -2.0, -3.14, 0]  # 底盘最小值。
       max: [2.0, 2.0, 3.14, 1]  # 底盘最大值。
+    sg100:  # SG100（黑曼灵巧手）action/state 上下限，与 gripper 一样是归一化后的 [0,1]（22维，双手各11）。
+      min: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      max: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
   is_binary: false  # 夹爪是否按开/关处理。
 
 inference:  # 推理和评测设置。

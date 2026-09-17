@@ -56,6 +56,7 @@ class LimitsConfig:
     ))
     base: Range = field(default_factory=lambda: Range([-2.0, -2.0, -3.14, 0],
                                                       [2.0, 2.0, 3.14, 1]))
+    sg100: Range = field(default_factory=lambda: Range([0] * 22, [1] * 22))
 
 # -----------------------
 # Environment Dataclass
@@ -95,8 +96,8 @@ class ConfigEnv:
     def validate(self):
         if self.inference_env not in ["sim", "real"]:
             raise ValueError("env.inference_env must be 'sim' or 'real'")
-        if self.eef_type not in ["rq2f85", "leju_claw", "qiangnao"]:
-            raise ValueError(f"Invalid eef_type: {self.eef_type}. Valid: rq2f85, leju_claw, qiangnao")
+        if self.eef_type not in ["rq2f85", "leju_claw", "qiangnao", "sg100"]:
+            raise ValueError(f"Invalid eef_type: {self.eef_type}. Valid: rq2f85, leju_claw, qiangnao, sg100")
         if self.platform_type not in ["4pro", "5w", "5"]:
             raise ValueError(f"Invalid platform_type: {self.platform_type}. Valid: 4pro, 5w, 5")
         if self.which_arm not in ["left", "right", "both"]:
@@ -137,6 +138,12 @@ class ConfigEnv:
                 "right": [[6, 7]],
                 "both": [[0, 1], [6, 7]]
             }[self.which_arm]
+        elif self.eef_type == "sg100":
+            return {
+                "left": [[0, 11]],
+                "right": [[11, 22]],
+                "both": [[0, 11], [11, 22]]
+            }[self.which_arm]
         else:
             raise ValueError("Unsupported eef_type or dof config")
 
@@ -160,7 +167,7 @@ class ConfigEnv:
             # 特殊键处理
             if key == "joint_q":
                 base["handle"]["params"]["slice"] = self.joint_q_slice
-            if key in ["rq2f85", "qiangnao", "leju_claw"]:
+            if key in ["rq2f85", "qiangnao", "leju_claw", "sg100"]:
                 base["handle"]["params"]["slice"] = self.gripper_slice
                 obs_map["gripper"] = base
                 continue
@@ -374,8 +381,8 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
             env_cfg["real"] = True
             env_cfg.setdefault("platform_type", "4pro")
             env_cfg.setdefault("eef_type", "leju_claw")
-            if env_cfg["eef_type"] not in {"leju_claw", "qiangnao"}:
-                raise ValueError("When inference_env=real, eef_type must be 'leju_claw' or 'qiangnao'")
+            if env_cfg["eef_type"] not in {"leju_claw", "qiangnao", "sg100"}:
+                raise ValueError("When inference_env=real, eef_type must be 'leju_claw', 'qiangnao' or 'sg100'")
             env_cfg["head_init"] = None
             env_cfg["image_size"] = [848, 480]
 
@@ -399,7 +406,7 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
                 continue
             if key == "depth_r" and which_arm == "left":
                 continue
-            if key in {"rq2f85", "leju_claw", "qiangnao"} and key != eef_type:
+            if key in {"rq2f85", "leju_claw", "qiangnao", "sg100"} and key != eef_type:
                 continue
             filtered[key] = value
         env_cfg["obs_key_map"] = filtered

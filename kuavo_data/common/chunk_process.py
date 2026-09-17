@@ -186,7 +186,7 @@ class ChunkedRosbagProcessor:
         gripper_keys = []
         for k in self._topic_process_map.keys():
             k_lower = k.lower()
-            if 'action' in k_lower and any(kw in k_lower for kw in ['claw', 'qiangnao', 'rq2f85', 'gripper']):
+            if 'action' in k_lower and any(kw in k_lower for kw in ['claw', 'qiangnao', 'rq2f85', 'gripper', 'sg100']):
                 gripper_keys.append(k)
                 
         # 2. 维护一个跨 chunk 的状态，主要针对夹爪保持先前状态

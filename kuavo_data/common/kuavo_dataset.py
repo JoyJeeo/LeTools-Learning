@@ -46,6 +46,38 @@ DEFAULT_LEJUCLAW_JOINT_NAMES = [
     "left_claw", "right_claw",
 ]
 
+# SG100（黑曼）灵巧手关节名，顺序与 SG100HandCommand.msg / SG100HandState.msg
+# 的 left_hand_positions / right_hand_positions (11 DOF each) 一致
+DEFAULT_SG100_JOINT_NAMES = [
+    "left_thumb_j1", "left_thumb_j2", "left_thumb_j3",
+    "left_index_j1", "left_index_j2", "left_index_j3",
+    "left_middle_j1", "left_middle_j2",
+    "left_little_j1", "left_little_j2", "left_little_j3",
+    "right_thumb_j1", "right_thumb_j2", "right_thumb_j3",
+    "right_index_j1", "right_index_j2", "right_index_j3",
+    "right_middle_j1", "right_middle_j2",
+    "right_little_j1", "right_little_j2", "right_little_j3",
+]
+
+# SG100 单手 11 个关节的 (lower, upper) 弧度限位，取自
+# kuavo-ros-control/src/kuavo_assets/models/heiman_sg100/urdf/heiman_{left,right}_hand.urdf
+# 顺序需与 DEFAULT_SG100_JOINT_NAMES 单手部分一致
+SG100_SINGLE_HAND_JOINT_LIMITS = [
+    (0.0, 2.182),    # thumb_j1
+    (-2.62, 0.0),    # thumb_j2
+    (-1.05, 1.57),   # thumb_j3
+    (-1.57, 0.0),    # index_j1
+    (0.0, 2.18),     # index_j2
+    (-1.05, 1.57),   # index_j3
+    (0.0, 2.18),     # middle_j1
+    (-1.05, 1.57),   # middle_j2
+    (0.0, 3.14),     # little_j1
+    (0.0, 2.18),     # little_j2
+    (-1.05, 1.57),   # little_j3
+]
+# 左右手各一份，共 22 维，顺序与 DEFAULT_SG100_JOINT_NAMES 一致
+SG100_JOINT_LIMITS = SG100_SINGLE_HAND_JOINT_LIMITS * 2
+
 DEFAULT_JOINT_NAMES_LIST = DEFAULT_ARM_JOINT_NAMES
 
 DEFAULT_JOINT_NAMES = {
@@ -58,10 +90,10 @@ DEFAULT_JOINT_NAMES = {
 def init_parameters(cfg):
 
     global DEFAULT_CAMERA_NAMES, TRAIN_HZ, MAIN_TIMELINE_FPS, SAMPLE_DROP, CONTROL_HAND_SIDE, MAIN_TIMELINE
-    global SLICE_ROBOT, SLICE_DEX, SLICE_CLAW
+    global SLICE_ROBOT, SLICE_DEX, SLICE_CLAW, SLICE_SG100
     global IS_BINARY, DELTA_ACTION, RELATIVE_START
     global RESIZE_W, RESIZE_H
-    global USE_LEJU_CLAW, USE_QIANGNAO
+    global USE_LEJU_CLAW, USE_QIANGNAO, USE_SG100
     global USE_DEPTH, DEPTH_RANGE
     global TASK_DESCRIPTION
     global DEX_DOF_NEEDED
@@ -87,6 +119,7 @@ def init_parameters(cfg):
     SLICE_DEX = config.dex_slice
     DEX_DOF_NEEDED = config.dex_dof_needed
     SLICE_CLAW = config.claw_slice
+    SLICE_SG100 = config.sg100_slice
 
     # 处理标志
     IS_BINARY = config.is_binary
@@ -99,6 +132,7 @@ def init_parameters(cfg):
 
     USE_LEJU_CLAW = config.use_leju_claw  # 由eef_type决定
     USE_QIANGNAO = config.use_qiangnao  # 由eef_type决定
+    USE_SG100 = config.use_sg100  # 由eef_type决定
 
     TASK_DESCRIPTION = config.task_description  # 任务描述
 
@@ -259,7 +293,33 @@ class KuavoMsgProcesser:
         position= list(msg.left_hand_position)
         position.extend(list(msg.right_hand_position))
         return { "data": position, "timestamp": msg.header.stamp.to_sec() }
-    
+
+    @staticmethod
+    def process_sg100_state(msg):
+        """
+            Args:
+                msg (kuavo_msgs/SG100HandState): SG100灵巧手状态消息，每手11个关节(rad)。
+            Returns:
+                Dict:
+                    - data(np.ndarray): 左右手拼接的关节位置，shape (22,)。
+                    - left_connected/right_connected (bool): 左右手在线状态。
+                    - left_error/right_error (int): 左右手错误码，0为正常。
+        """
+        state = list(msg.left_hand_positions) + list(msg.right_hand_positions)
+        return {
+            "data": state,
+            "timestamp": msg.header.stamp.to_sec(),
+            "left_connected": bool(msg.left_hand_connected),
+            "right_connected": bool(msg.right_hand_connected),
+            "left_error": int(msg.left_error_code),
+            "right_error": int(msg.right_error_code),
+        }
+
+    @staticmethod
+    def process_sg100_cmd(msg):
+        position = list(msg.left_hand_positions) + list(msg.right_hand_positions)
+        return { "data": position, "timestamp": msg.header.stamp.to_sec() }
+
 
     @staticmethod
     def process_sensors_data_raw_extract_imu(msg):
@@ -349,6 +409,16 @@ class KuavoRosbagReader:
             "action.rq2f85": {
                 "topic": "/gripper/command",
                 "msg_process_fn": self._msg_processer.process_rq2f85_cmd,
+            },
+            "observation.sg100": {
+                # SG100（黑曼）灵巧手状态：左右手各11个关节位置（rad）
+                "topic": "/sg100_hand_state",
+                "msg_process_fn": self._msg_processer.process_sg100_state,
+            },
+            "action.sg100": {
+                # SG100（黑曼）灵巧手指令：左右手各11个关节位置（rad）
+                "topic": "/sg100_hand_command",
+                "msg_process_fn": self._msg_processer.process_sg100_cmd,
             },
         }
         for camera in DEFAULT_CAMERA_NAMES:

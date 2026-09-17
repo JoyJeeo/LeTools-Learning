@@ -64,6 +64,11 @@ class Config:
     def use_qiangnao(self) -> bool:
         """Determine if using qiangnao based on eef_type."""
         return self.eef_type == 'qiangnao'
+
+    @property
+    def use_sg100(self) -> bool:
+        """Determine if using SG100 (黑曼灵巧手) based on eef_type."""
+        return self.eef_type == 'sg100'
     
     @property
     def default_camera_names(self) -> List[str]:
@@ -120,6 +125,18 @@ class Config:
         else:
             raise ValueError(f"Invalid which_arm: {self.which_arm}")
 
+    @property
+    def sg100_slice(self) -> List[List[int]]:
+        """Get SG100 (黑曼灵巧手) slice based on which arm. 每只手11个自由度。"""
+        if self.which_arm == 'left':
+            return [[0, 11], [11, 11]]  # 左手使用SG100，右手不使用
+        elif self.which_arm == 'right':
+            return [[0, 0], [11, 22]]  # 左手不使用，右手使用SG100
+        elif self.which_arm == 'both':
+            return [[0, 11], [11, 22]]  # 双手都使用SG100
+        else:
+            raise ValueError(f"Invalid which_arm: {self.which_arm}")
+
 def load_config(cfg) -> Config:
     """Load configuration from YAML file.
     
@@ -133,8 +150,8 @@ def load_config(cfg) -> Config:
     # Validate eef_type
     eef_type = OmegaConf.select(cfg, "dataset.eef_type")
 
-    if eef_type not in ['qiangnao', 'leju_claw', 'rq2f85']:
-        raise ValueError(f"Invalid eef_type: {eef_type}, must be 'qiangnao' or 'leju_claw','rq2f85' .")
+    if eef_type not in ['qiangnao', 'leju_claw', 'rq2f85', 'sg100']:
+        raise ValueError(f"Invalid eef_type: {eef_type}, must be 'qiangnao', 'leju_claw', 'rq2f85' or 'sg100'.")
     
     # Validate which_arm
     which_arm = OmegaConf.select(cfg, 'dataset.which_arm')

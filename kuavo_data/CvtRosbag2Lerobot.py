@@ -346,17 +346,48 @@ def populate_dataset_chunked(
                 qiangnao_action= get_array("action.qiangnao", np.float32)
                 rq2f85_state   = get_array("observation.rq2f85", np.float32)
                 rq2f85_action  = get_array("action.rq2f85", np.float32)
+                sg100_state    = get_array("observation.sg100", np.float32)
+                sg100_action   = get_array("action.sg100", np.float32)
 
-                if claw_state.size == 0 and qiangnao_state.size == 0 and rq2f85_state.size==0:
+                if kuavo.USE_SG100:
+                    # SG100 状态里带连接状态/错误码，数据陈旧或掉线时直接丢弃该帧
+                    sg100_state_item = aligned_frame.get("observation.sg100")
+                    if sg100_state_item is None:
+                        log_print.warning(f"Episode {ep_idx} Frame {frame_idx}: Missing SG100 state data")
+                        return
+                    if (not sg100_state_item.get("left_connected", True)
+                            or not sg100_state_item.get("right_connected", True)
+                            or sg100_state_item.get("left_error", 0) != 0
+                            or sg100_state_item.get("right_error", 0) != 0):
+                        log_print.warning(
+                            f"Episode {ep_idx} Frame {frame_idx}: SG100 disconnected or error "
+                            f"(left_connected={sg100_state_item.get('left_connected')}, "
+                            f"right_connected={sg100_state_item.get('right_connected')}, "
+                            f"left_error={sg100_state_item.get('left_error')}, "
+                            f"right_error={sg100_state_item.get('right_error')}), skipping frame"
+                        )
+                        return
+                    if sg100_state.size == 0 or sg100_action.size == 0:
+                        log_print.warning(f"Episode {ep_idx} Frame {frame_idx}: Missing SG100 state/action data")
+                        return
+                elif claw_state.size == 0 and qiangnao_state.size == 0 and rq2f85_state.size==0:
                     # log_print.warning(f"Episode {ep_idx} Frame {frame_idx}: Missing eef state data")
                     return
-                if claw_action.size == 0 and qiangnao_action.size==0 and rq2f85_action.size ==0:
+                elif claw_action.size == 0 and qiangnao_action.size==0 and rq2f85_action.size ==0:
                     # log_print.warning(f"Episode {ep_idx} Frame {frame_idx}: Missing eef action data")
                     return
                 # =========================
-                # 4. 手部归一化（保持原逻辑）
+                # 4. 手部归一化
                 # =========================
-                if kuavo.IS_BINARY:
+                if kuavo.USE_SG100:
+                    # SG100 单位是弧度，且每个关节上下限方向不同，需按各关节的真实限位做 min-max 归一化，
+                    # 不能套用 claw/qiangnao 的百分比/二值化逻辑
+                    sg100_lo = np.array([lo for lo, _ in kuavo.SG100_JOINT_LIMITS], dtype=np.float32)
+                    sg100_hi = np.array([hi for _, hi in kuavo.SG100_JOINT_LIMITS], dtype=np.float32)
+                    sg100_range = sg100_hi - sg100_lo
+                    sg100_state  = np.clip((sg100_state - sg100_lo) / sg100_range, 0.0, 1.0)
+                    sg100_action = np.clip((sg100_action - sg100_lo) / sg100_range, 0.0, 1.0)
+                elif kuavo.IS_BINARY:
                     qiangnao_state  = np.where(qiangnao_state > 50, 1, 0)
                     qiangnao_action = np.where(qiangnao_action > 50, 1, 0)
                     claw_state      = np.where(claw_state > 50, 1, 0)
@@ -375,15 +406,20 @@ def populate_dataset_chunked(
                     # rq2f85_state = rq2f85_state / 0.8
                     # rq2f85_action = rq2f85_action / 255
 
-                if claw_action.size == 0 and qiangnao_action.size == 0:
+                if not kuavo.USE_SG100 and claw_action.size == 0 and qiangnao_action.size == 0:
                     claw_action = rq2f85_action
                     claw_state  = rq2f85_state
 
                 # =========================
                 # 5. 构建最终 state / action
                 # =========================
-                if kuavo.USE_LEJU_CLAW or kuavo.USE_QIANGNAO:
-                    hand_type = "LEJU" if kuavo.USE_LEJU_CLAW else "QIANGNAO"
+                if kuavo.USE_LEJU_CLAW or kuavo.USE_QIANGNAO or kuavo.USE_SG100:
+                    if kuavo.USE_SG100:
+                        hand_type = "SG100"
+                    elif kuavo.USE_LEJU_CLAW:
+                        hand_type = "LEJU"
+                    else:
+                        hand_type = "QIANGNAO"
                     s_list, a_list = [], []
 
                     def get_hand_slice(hand_side):
@@ -395,6 +431,12 @@ def populate_dataset_chunked(
                                                 claw_state[c_slice[0]:c_slice[-1]]))
                             a = np.concatenate((action[s_slice[0]:s_slice[-1]],
                                                 claw_action[c_slice[0]:c_slice[-1]]))
+                        elif hand_type == "SG100":
+                            g_slice = kuavo.SLICE_SG100[hand_side]
+                            s = np.concatenate((state[s_slice[0]:s_slice[-1]],
+                                                sg100_state[g_slice[0]:g_slice[-1]]))
+                            a = np.concatenate((action[s_slice[0]:s_slice[-1]],
+                                                sg100_action[g_slice[0]:g_slice[-1]]))
                         else:
                             d_slice = kuavo.SLICE_DEX[hand_side]
                             s = np.concatenate((state[s_slice[0]:s_slice[-1]],
@@ -482,7 +524,7 @@ def populate_dataset_chunked(
             dataset.save_episode()
             frames_buffer.clear()
             gc.collect()
-            
+
             log_print.info(f"Episode {ep_idx} completed: {frame_count[0]} frames")
             
         except Exception as e:
@@ -689,6 +731,7 @@ def main(cfg: DictConfig):
     half_arm = len(kuavo.DEFAULT_ARM_JOINT_NAMES) // 2
     half_claw = len(kuavo.DEFAULT_LEJUCLAW_JOINT_NAMES) // 2
     half_dexhand = len(kuavo.DEFAULT_DEXHAND_JOINT_NAMES) // 2
+    half_sg100 = len(kuavo.DEFAULT_SG100_JOINT_NAMES) // 2
     arm_base_start, _ = get_arm_joint_slice(kuavo.PLATFORM_TYPE)
     if kuavo.USE_LEJU_CLAW:
         DEFAULT_ARM_JOINT_NAMES = kuavo.DEFAULT_ARM_JOINT_NAMES[:half_arm] + kuavo.DEFAULT_LEJUCLAW_JOINT_NAMES[:half_claw] \
@@ -697,12 +740,19 @@ def main(cfg: DictConfig):
             (kuavo.SLICE_ROBOT[0][0] - arm_base_start, kuavo.SLICE_ROBOT[0][-1] - arm_base_start),(kuavo.SLICE_CLAW[0][0] + half_arm, kuavo.SLICE_CLAW[0][-1] + half_arm),
             (kuavo.SLICE_ROBOT[1][0] - arm_base_start + half_claw, kuavo.SLICE_ROBOT[1][-1] - arm_base_start + half_claw), (kuavo.SLICE_CLAW[1][0] + half_arm * 2, kuavo.SLICE_CLAW[1][-1] + half_arm * 2)
             ]
-    elif kuavo.USE_QIANGNAO:  
+    elif kuavo.USE_QIANGNAO:
         DEFAULT_ARM_JOINT_NAMES = kuavo.DEFAULT_ARM_JOINT_NAMES[:half_arm] + kuavo.DEFAULT_DEXHAND_JOINT_NAMES[:half_dexhand] \
-                                + kuavo.DEFAULT_ARM_JOINT_NAMES[half_arm:] + kuavo.DEFAULT_DEXHAND_JOINT_NAMES[half_dexhand:]               
+                                + kuavo.DEFAULT_ARM_JOINT_NAMES[half_arm:] + kuavo.DEFAULT_DEXHAND_JOINT_NAMES[half_dexhand:]
         arm_slice = [
             (kuavo.SLICE_ROBOT[0][0] - arm_base_start, kuavo.SLICE_ROBOT[0][-1] - arm_base_start),(kuavo.SLICE_DEX[0][0] + half_arm, kuavo.SLICE_DEX[0][-1] + half_arm),
             (kuavo.SLICE_ROBOT[1][0] - arm_base_start + half_dexhand, kuavo.SLICE_ROBOT[1][-1] - arm_base_start + half_dexhand), (kuavo.SLICE_DEX[1][0] + half_arm * 2, kuavo.SLICE_DEX[1][-1] + half_arm * 2)
+            ]
+    elif kuavo.USE_SG100:
+        DEFAULT_ARM_JOINT_NAMES = kuavo.DEFAULT_ARM_JOINT_NAMES[:half_arm] + kuavo.DEFAULT_SG100_JOINT_NAMES[:half_sg100] \
+                                + kuavo.DEFAULT_ARM_JOINT_NAMES[half_arm:] + kuavo.DEFAULT_SG100_JOINT_NAMES[half_sg100:]
+        arm_slice = [
+            (kuavo.SLICE_ROBOT[0][0] - arm_base_start, kuavo.SLICE_ROBOT[0][-1] - arm_base_start),(kuavo.SLICE_SG100[0][0] + half_arm, kuavo.SLICE_SG100[0][-1] + half_arm),
+            (kuavo.SLICE_ROBOT[1][0] - arm_base_start + half_sg100, kuavo.SLICE_ROBOT[1][-1] - arm_base_start + half_sg100), (kuavo.SLICE_SG100[1][0] + half_arm * 2, kuavo.SLICE_SG100[1][-1] + half_arm * 2)
             ]
     DEFAULT_JOINT_NAMES_LIST = [DEFAULT_ARM_JOINT_NAMES[k] for l, r in arm_slice for k in range(l, r)]
 

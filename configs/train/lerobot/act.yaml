@@ -8,8 +8,8 @@ training:
   output_dir: "outputs/train/act" # 权重存储路径
   job_name: "act"  # 实验名。
   batch_size: 16  
-  steps: 1000  # 总训练步数
-  save_freq: 200  # 每N步保存一次权重
+  steps: 500000  # 总训练步数
+  save_freq: 50000  # 每N步保存一次权重
   num_workers: 8  
   seed: 24  
 

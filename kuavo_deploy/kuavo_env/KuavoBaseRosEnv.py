@@ -786,21 +786,61 @@ class LejuClaw:
 
 
 class SG100Hand:
-    """SG100（黑曼灵巧手）控制器，每手11个关节，单位弧度"""
+    """SG100（黑曼灵巧手）控制器，每手11个关节，单位弧度。
+
+    真机：sg100_hand_driver.cpp 订阅 /sg100_hand_command(SG100HandCommand)，
+    仅将 MODE_JOINT_POSITION(=7) 当作有效位置控制模式。
+    仿真：mujoco 的 BLACK_MAN_11(dexhand_mujoco_node) 不监听 /sg100_hand_command，
+    只订阅 /cb_left_hand_control_cmd、/cb_right_hand_control_cmd(sensor_msgs/JointState)，
+    joint 名形如 "l_thumb_j1"（见 black_man_11_hand.hpp）。
+    两套后端话题、消息类型都不同，且 config.env.real 只表示"走真实 ROS 控制接口"这条代码路径
+    （KuavoRealEnv），并不代表连的是物理硬件还是 mujoco 仿真，无法据此判断该发哪条话题。
+    因此这里两条都发：真机场景下 /cb_*_hand_control_cmd 没有订阅者，仿真场景下
+    /sg100_hand_command 没有订阅者，多发的一条不会有副作用。
+    """
+
+    _JOINT_SUFFIXES = [
+        "thumb_j1", "thumb_j2", "thumb_j3",
+        "index_j1", "index_j2", "index_j3",
+        "middle_j1", "middle_j2",
+        "little_j1", "little_j2", "little_j3",
+    ]
+
     def __init__(self, ros_manager=None):
         self.ros_manager = ros_manager or ROSManager()
         self._pub_sg100_cmd = self.ros_manager.register_publisher('/sg100_hand_command', SG100HandCommand, queue_size=10)
+        self._pub_left_cmd = self.ros_manager.register_publisher('/cb_left_hand_control_cmd', JointState, queue_size=10)
+        self._pub_right_cmd = self.ros_manager.register_publisher('/cb_right_hand_control_cmd', JointState, queue_size=10)
+        self._left_names = [f"l_{suffix}" for suffix in self._JOINT_SUFFIXES]
+        self._right_names = [f"r_{suffix}" for suffix in self._JOINT_SUFFIXES]
 
     def control(self, left_positions: list, right_positions: list):
         """控制双手，left_positions/right_positions 均为长度11的弧度列表"""
         assert len(left_positions) == 11, "left_positions must be a list of length 11"
         assert len(right_positions) == 11, "right_positions must be a list of length 11"
 
+        # 真机：/sg100_hand_command
         cmd = SG100HandCommand()
-        cmd.control_mode = SG100HandCommand.MODE_POSITION
+        # 驱动侧(sg100_hand_driver.cpp)仅把 MODE_JOINT_POSITION(=7)当作有效的位置控制模式，
+        # MODE_POSITION(=1)不会匹配 isPositionMode/isImpedanceMode，会被驱动强制置为 MODE_NULL（关节保持不动）。
+        cmd.control_mode = SG100HandCommand.MODE_JOINT_POSITION
         cmd.left_hand_positions = list(left_positions)
         cmd.right_hand_positions = list(right_positions)
         self._pub_sg100_cmd.publish(cmd)
+
+        # 仿真：/cb_left_hand_control_cmd、/cb_right_hand_control_cmd
+        stamp = rospy.Time.now()
+        left_msg = JointState()
+        left_msg.header.stamp = stamp
+        left_msg.name = self._left_names
+        left_msg.position = list(left_positions)
+        self._pub_left_cmd.publish(left_msg)
+
+        right_msg = JointState()
+        right_msg.header.stamp = stamp
+        right_msg.name = self._right_names
+        right_msg.position = list(right_positions)
+        self._pub_right_cmd.publish(right_msg)
 
     def close(self):
         """释放资源"""

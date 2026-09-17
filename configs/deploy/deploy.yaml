@@ -1,5 +1,5 @@
 env:  # 推理环境设置
-  inference_env: real  # 选仿真还是真机 option: sim/real
+  inference_env: sim  # 选仿真还是真机 option: sim/real
   platform_type: "5w"  # 机器人型号 option: "4pro"/"5"/"5w"
   which_arm: both  # 控制左手、右手还是双手 option: both/left/right
   eef_type: sg100  # 夹爪或手型类型  option: leju_claw/qiangnao/rq2f85(仿真)
@@ -13,8 +13,8 @@ env:  # 推理环境设置
 
 inference:  # 推理和评测设置
   go_bag_path: null    # bag 回放路径
-  policy_type: client  # 要加载的模型类型,外挂模式选择client, 选择client模式后下面的pretrained_path失去作用
-  pretrained_path: /path/to/checkpoint  # 要加载的权重路径。
+  policy_type: act  # 要加载的模型类型,外挂模式选择client, 选择client模式后下面的pretrained_path失去作用
+  pretrained_path: /home/zhangyutao/yuto/codes/work/LeTools-Learning/outputs/train/act_20260917_213422/checkpoints/last/pretrained_model  # 要加载的权重路径。
   eval_episodes: 10  # 评测跑多少条
   max_episode_steps: 200  # 每条最多跑多少步
   task_prompt: "Pick and Place"

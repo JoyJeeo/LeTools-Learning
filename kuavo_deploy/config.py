@@ -384,7 +384,7 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
             if env_cfg["eef_type"] not in {"leju_claw", "qiangnao", "sg100"}:
                 raise ValueError("When inference_env=real, eef_type must be 'leju_claw', 'qiangnao' or 'sg100'")
             env_cfg["head_init"] = None
-            env_cfg["image_size"] = [848, 480]
+            env_cfg.setdefault("image_size", [848, 480])
 
         return cfg_dict
 

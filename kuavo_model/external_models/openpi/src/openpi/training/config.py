@@ -19,7 +19,11 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.kuavo_left_policy as kuavo_left_policy
+import openpi.policies.kuavo_policy as kuavo_policy
+import openpi.policies.kuavo_right_policy as kuavo_right_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.roban_wholebody_policy as roban_wholebody_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -28,7 +32,6 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
-from openpi.policies import kuavo_policy, kuavo_right_policy, kuavo_left_policy
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -474,6 +477,13 @@ class LeRobotKuavoDataConfig(DataConfigFactory):
     extra_delta_transform: bool = True
     root: str | None = None
     video_backend: str | None = "pyav"
+    arm_joint_dim: int = 7
+    end_effector_dim: int = 1
+    lower_body_joint_dim: int = 0
+
+    @property
+    def physical_action_dim(self) -> int:
+        return 2 * (self.arm_joint_dim + self.end_effector_dim) + self.lower_body_joint_dim
     # # Enable prompt augmentation for training (randomizes prompt phrasing)
     # use_prompt_augmentation: bool = False
     # # Prompt templates used when prompt augmentation is enabled.
@@ -532,7 +542,7 @@ class LeRobotKuavoDataConfig(DataConfigFactory):
             inputs=[kuavo_policy.KuavoInputs(
                 model_type=model_config.model_type
             )],
-            outputs=[kuavo_policy.KuavoOutputs()],
+            outputs=[kuavo_policy.KuavoOutputs(action_dim=self.physical_action_dim)],
         )
 
         # One additional data transform: pi0 models are trained on delta actions (relative to the first
@@ -548,7 +558,15 @@ class LeRobotKuavoDataConfig(DataConfigFactory):
         # LIBERO already represents actions as deltas, but we have some old Pi0 checkpoints that are trained with this
         # extra delta transform.
         if self.extra_delta_transform:
-            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
+            # Joint-position targets use deltas during training; end effectors
+            # remain absolute. The output transform restores absolute targets.
+            delta_action_mask = _transforms.make_bool_mask(
+                self.arm_joint_dim,
+                -self.end_effector_dim,
+                self.arm_joint_dim,
+                -self.end_effector_dim,
+                self.lower_body_joint_dim,
+            )
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -665,6 +683,61 @@ class LeRobotKuavoLeftDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotRobanWholebodyDataConfig(DataConfigFactory):
+    """LeRobot mapping for Roban's 23-D state, 32-D action and head camera."""
+
+    extra_delta_transform: bool = True
+    root: str | None = None
+    video_backend: str | None = "pyav"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if model_config.action_dim < roban_wholebody_policy.ACTION_DIM:
+            raise ValueError(
+                "Roban wholebody requires model.action_dim >= "
+                f"{roban_wholebody_policy.ACTION_DIM}, got {model_config.action_dim}"
+            )
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "head": "observation.images.head_cam_h",
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                roban_wholebody_policy.RobanWholebodyInputs(
+                    model_type=model_config.model_type
+                )
+            ],
+            outputs=[roban_wholebody_policy.RobanWholebodyOutputs()],
+        )
+        if self.extra_delta_transform:
+            # State and action share the same layout for their first 23 values.
+            # Learn joint deltas, keep both grippers absolute, and leave the
+            # uncovered root_xyz/root_rot6d action tail absolute.
+            delta_action_mask = _transforms.make_bool_mask(4, -1, 4, -1, 13)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=("action",),
+            root=self.root,
+            video_backend=self.video_backend,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -762,6 +835,37 @@ class TrainConfig:
 _CONFIGS = [
     #
     TrainConfig(
+        name="pi05_roban_wholebody",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=roban_wholebody_policy.ACTION_DIM,
+            discrete_state_input=True
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        data=LeRobotRobanWholebodyDataConfig(
+            repo_id="roban_wholebody",
+            root="/path/to/dataset/",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=60_000,
+        save_interval=20_000,
+        batch_size=32,
+        num_workers=8,
+        checkpoint_base_dir="/path/to/save_dir",
+    ),
+
+    TrainConfig(
         # Change the name to reflect your model and dataset.
         name="pi0_kuavo",
         # Here you define the model config -- In this example we use pi0 as the model
@@ -792,6 +896,26 @@ _CONFIGS = [
         # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=60_000,
         # wandb_enabled=False,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+    ),
+    TrainConfig(
+        name="pi0_kuavo_5w_wholebody",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotKuavoDataConfig(
+            repo_id="test-sim",
+            root="/path/to/dataset/",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            lower_body_joint_dim=4,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
         batch_size=32,
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"

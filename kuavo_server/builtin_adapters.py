@@ -5,12 +5,22 @@ from __future__ import annotations
 import importlib
 
 ADAPTER_MODULES: dict[str, str] = {
+    "g05": "kuavo_server.adapters.g05",
     "lingbot_vla": "kuavo_server.adapters.lingbot_vla",
     "lingbot_vla_v2": "kuavo_server.adapters.lingbot_vla_v2",
+    "lingbot_vla_v2_roban_wholebody": (
+        "kuavo_server.adapters.lingbot_vla_v2_roban_wholebody"
+    ),
     "openpi": "kuavo_server.adapters.openpi",
+    "openpi_roban_wholebody": "kuavo_server.adapters.openpi_roban_wholebody",
     "wall_x": "kuavo_server.adapters.wall_x",
     "isaac_gr00t": "kuavo_server.adapters.isaac_gr00t",
     "isaac_gr00t_n17": "kuavo_server.adapters.isaac_gr00t_n17",
+    "isaac_gr00t_n17_roban_wholebody": (
+        "kuavo_server.adapters.isaac_gr00t_n17_roban_wholebody"
+    ),
+    "xiaomi_robotics_0": "kuavo_server.adapters.xiaomi_robotics_0",
+    "xiaomi_robotics_1": "kuavo_server.adapters.xiaomi_robotics_1",
 }
 
 

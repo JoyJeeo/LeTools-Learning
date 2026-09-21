@@ -27,9 +27,10 @@ from pprint import pprint
 import os
 import glob
 from collections import defaultdict
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 from numpy.lib.stride_tricks import sliding_window_view
 from .config_platform import get_arm_joint_slice, DEFAULT_PLATFORM
+from .h265_utils import detect_camera_encodings_from_bag, get_h265_topic
 
 
 # ================ 机器人关节信息定义 ================
@@ -42,9 +43,15 @@ DEFAULT_DEXHAND_JOINT_NAMES = [
     "left_qiangnao_1", "left_qiangnao_2","left_qiangnao_3","left_qiangnao_4","left_qiangnao_5","left_qiangnao_6",
     "right_qiangnao_1", "right_qiangnao_2","right_qiangnao_3","right_qiangnao_4","right_qiangnao_5","right_qiangnao_6",
 ]
+DEFAULT_SG100_JOINT_NAMES = [
+    *[f"left_sg100_{i}" for i in range(1, 12)],
+    *[f"right_sg100_{i}" for i in range(1, 12)],
+]
 DEFAULT_LEJUCLAW_JOINT_NAMES = [
     "left_claw", "right_claw",
 ]
+DEFAULT_LOWER_BODY_JOINT_NAME_PREFIX = "wheel_lower_joint"
+DEFAULT_BASE_VELOCITY_NAMES = ["vx", "vy", "vyaw"]
 
 DEFAULT_JOINT_NAMES_LIST = DEFAULT_ARM_JOINT_NAMES
 
@@ -59,13 +66,13 @@ def init_parameters(cfg):
 
     global DEFAULT_CAMERA_NAMES, TRAIN_HZ, MAIN_TIMELINE_FPS, SAMPLE_DROP, CONTROL_HAND_SIDE, MAIN_TIMELINE
     global SLICE_ROBOT, SLICE_DEX, SLICE_CLAW
-    global IS_BINARY, DELTA_ACTION, RELATIVE_START
+    global IS_BINARY, RELATIVE_START
     global RESIZE_W, RESIZE_H
-    global USE_LEJU_CLAW, USE_QIANGNAO
+    global USE_LEJU_CLAW, USE_QIANGNAO, USE_SG100
     global USE_DEPTH, DEPTH_RANGE
     global TASK_DESCRIPTION
-    global DEX_DOF_NEEDED
-    global PLATFORM_TYPE
+    global DEX_DOF_NEEDED, DEX_DOF_OFFSET
+    global PLATFORM_TYPE, USE_5W_WHOLEBODY, USE_5W_BASE_MOVE
 
     
     from .config_dataset import load_config
@@ -81,16 +88,18 @@ def init_parameters(cfg):
     SAMPLE_DROP = config.sample_drop
     CONTROL_HAND_SIDE = config.which_arm
     PLATFORM_TYPE = config.platform_type
+    USE_5W_WHOLEBODY = config.use_5w_wholebody
+    USE_5W_BASE_MOVE = config.use_5w_base_move
 
     # 根据which_arm自动计算的切片配置
     SLICE_ROBOT = config.slice_robot
     SLICE_DEX = config.dex_slice
     DEX_DOF_NEEDED = config.dex_dof_needed
+    DEX_DOF_OFFSET = config.dex_dof_offset
     SLICE_CLAW = config.claw_slice
 
     # 处理标志
     IS_BINARY = config.is_binary
-    DELTA_ACTION = config.delta_action
     RELATIVE_START = config.relative_start
 
     # 图像尺寸设置
@@ -99,6 +108,7 @@ def init_parameters(cfg):
 
     USE_LEJU_CLAW = config.use_leju_claw  # 由eef_type决定
     USE_QIANGNAO = config.use_qiangnao  # 由eef_type决定
+    USE_SG100 = config.use_sg100
 
     TASK_DESCRIPTION = config.task_description  # 任务描述
 
@@ -142,6 +152,11 @@ class KuavoMsgProcesser:
             cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         cv_img=cv2.resize(cv_img,(RESIZE_W,RESIZE_H)) ### ATT: resize the image to 640x480(w * h)
         return {"data": cv_img, "timestamp": msg.header.stamp.to_sec()}
+
+    @staticmethod
+    def process_h265_timestamp_only(msg):
+        """H.265 stream placeholder — timestamp scan / alignment only, no decode."""
+        return {"data": np.zeros((1, 1, 3), dtype=np.uint8), "timestamp": msg.header.stamp.to_sec()}
 
     @staticmethod
     def process_depth_image(msg):
@@ -212,6 +227,19 @@ class KuavoMsgProcesser:
         
         # radian
         return {"data": np.deg2rad(msg.position), "timestamp": msg.header.stamp.to_sec()}
+
+    # /lb_leg_traj uses the same JointState/degree convention as /kuavo_arm_traj.
+    process_lb_leg_traj = process_kuavo_arm_traj
+
+    @staticmethod
+    def process_cmd_vel(msg):
+        """Extract planar base velocity from a geometry_msgs/Twist message."""
+        velocity = np.array(
+            [msg.linear.x, msg.linear.y, msg.angular.z], dtype=np.float32
+        )
+        # geometry_msgs/Twist has no header. Bag time replaces this placeholder
+        # in both the regular and chunked readers.
+        return {"data": velocity, "timestamp": 0.0}
     
     @staticmethod
     def process_claw_state(msg):
@@ -259,6 +287,16 @@ class KuavoMsgProcesser:
         position= list(msg.left_hand_position)
         position.extend(list(msg.right_hand_position))
         return { "data": position, "timestamp": msg.header.stamp.to_sec() }
+
+    @staticmethod
+    def process_sg100_state(msg):
+        positions = list(msg.left_hand_positions) + list(msg.right_hand_positions)
+        return {"data": positions, "timestamp": msg.header.stamp.to_sec()}
+
+    @staticmethod
+    def process_sg100_cmd(msg):
+        positions = list(msg.left_hand_positions) + list(msg.right_hand_positions)
+        return {"data": positions, "timestamp": msg.header.stamp.to_sec()}
     
 
     @staticmethod
@@ -307,6 +345,8 @@ class KuavoMsgProcesser:
 class KuavoRosbagReader:
     def __init__(self):
         self._msg_processer = KuavoMsgProcesser()
+        self._camera_encodings: Dict[str, str] = {}
+        self._h265_cameras: set[str] = set()
         self._topic_process_map = {
             "observation.state": {
                 "topic": "/sensors_data_raw",
@@ -315,10 +355,6 @@ class KuavoRosbagReader:
             "action.kuavo_arm_traj": {
                 "topic": "/kuavo_arm_traj",
                 "msg_process_fn": self._msg_processer.process_kuavo_arm_traj,
-            },
-            "action": {
-                "topic": "/joint_cmd",
-                "msg_process_fn": self._msg_processer.process_joint_cmd,
             },
             "observation.imu": {
                 "topic": "/sensors_data_raw",
@@ -342,6 +378,14 @@ class KuavoRosbagReader:
                 "topic": "/control_robot_hand_position",
                 "msg_process_fn": self._msg_processer.process_qiangnao_cmd,
             },
+            "observation.sg100": {
+                "topic": "/sg100_hand_state",
+                "msg_process_fn": self._msg_processer.process_sg100_state,
+            },
+            "action.sg100": {
+                "topic": "/sg100_hand_command",
+                "msg_process_fn": self._msg_processer.process_sg100_cmd,
+            },
             "observation.rq2f85": {
                 "topic": "/gripper/state",
                 "msg_process_fn": self._msg_processer.process_rq2f85_state,
@@ -351,6 +395,16 @@ class KuavoRosbagReader:
                 "msg_process_fn": self._msg_processer.process_rq2f85_cmd,
             },
         }
+        if USE_5W_WHOLEBODY:
+            self._topic_process_map["action.lb_leg_traj"] = {
+                "topic": "/lb_leg_traj",
+                "msg_process_fn": self._msg_processer.process_lb_leg_traj,
+            }
+        if USE_5W_BASE_MOVE:
+            self._topic_process_map["action.base_velocity"] = {
+                "topic": "/cmd_vel",
+                "msg_process_fn": self._msg_processer.process_cmd_vel,
+            }
         for camera in DEFAULT_CAMERA_NAMES:
             # observation.images.{camera}.depth  => color images
             # if 'wrist' in camera or 'head_cam_h' in camera:
@@ -402,7 +456,55 @@ class KuavoRosbagReader:
                 "msg_process_fn": self._msg_processer.process_depth_image, 
                 }
 
+    def configure_for_bag(self, bag_file: str) -> Dict[str, str]:
+        """Detect JPEG vs H.265 topics per camera and patch the topic map."""
+        bag_topics = self._get_bag_topics(bag_file)
+        self._camera_encodings = detect_camera_encodings_from_bag(bag_file, DEFAULT_CAMERA_NAMES)
+        self._h265_cameras = {cam for cam, enc in self._camera_encodings.items() if enc == "h265"}
 
+        for camera in DEFAULT_CAMERA_NAMES:
+            encoding = self._camera_encodings.get(camera)
+            if encoding != "h265":
+                continue
+            h265_topic = get_h265_topic(camera)
+            if h265_topic is None:
+                continue
+            self._topic_process_map[camera] = {
+                "topic": h265_topic,
+                "msg_process_fn": self._msg_processer.process_h265_timestamp_only,
+                "_h265_pre_encoded": True,
+            }
+
+        # Bag may only record claw state without command topic.
+        # Assign "action.claw" to "/leju_claw_state" instead of "/leju_claw_command" only for testing.
+        # N.B. Remove this after testing.
+        # -------------------------------------------------------------------------------------
+        if "/leju_claw_command" not in bag_topics and "/leju_claw_state" in bag_topics:
+            if "action.claw" in self._topic_process_map:
+                self._topic_process_map["action.claw"] = {
+                    "topic": "/leju_claw_state",
+                    "msg_process_fn": self._msg_processer.process_claw_state,
+                }
+        # -------------------------------------------------------------------------------------
+
+        if self._h265_cameras:
+            print(f"H.265 cameras (direct encode path): {sorted(self._h265_cameras)}")
+        return self._camera_encodings
+
+    @staticmethod
+    def _get_bag_topics(bag_file: str) -> set[str]:
+        bag = rosbag.Bag(bag_file)
+        topics = set(bag.get_type_and_topic_info().topics.keys())
+        bag.close()
+        return topics
+
+    @property
+    def h265_cameras(self) -> set[str]:
+        return self._h265_cameras
+
+    @property
+    def camera_encodings(self) -> Dict[str, str]:
+        return self._camera_encodings
 
     def load_raw_rosbag(self, bag_file: str):
         try:
@@ -618,6 +720,7 @@ class KuavoRosbagReader:
             main_timeline=MAIN_TIMELINE,
             main_timeline_fps=MAIN_TIMELINE_FPS,
             sample_drop=SAMPLE_DROP,
+            h265_cameras=self._h265_cameras,
         )
         
         # 第一遍：只扫描时间戳（内存占用极小）

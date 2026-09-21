@@ -1,0 +1,17 @@
+# @package _global_
+
+data:
+  type: BaseDataModule
+  params:
+    type: lerobot
+    max_steps: ${trainer.max_steps}
+    processor_path: ${model.params.model.vlm_path}
+
+    train_datasets:
+      repo_id: lerobot/kuavo
+      root: /path/to/lerobot
+      fps: 10
+      batch_size: 16
+      action_length: 30
+      modality_config_path: /path/to/modality_config.yaml
+      stats_path: /path/to/stats.json

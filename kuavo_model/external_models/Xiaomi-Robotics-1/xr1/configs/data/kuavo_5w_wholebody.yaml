@@ -1,0 +1,19 @@
+# @package _global_
+
+data:
+  type: BaseDataModule
+  params:
+    type: lerobot
+    max_steps: ${trainer.max_steps}
+    processor_path: ${model.params.model.vlm_path}
+    num_workers: 8
+    prefetch_factor: 4
+
+    train_datasets:
+      repo_id: lerobot/kuavo_5w_wholebody
+      root: /path/to/kuavo_5w_wholebody/lerobot
+      fps: 10
+      batch_size: 16
+      action_length: 30
+      modality_config_path: /path/to/kuavo_5w_wholebody_xr1.modality.json
+      stats_path: /path/to/xr1_5w_wholebody_stats.json

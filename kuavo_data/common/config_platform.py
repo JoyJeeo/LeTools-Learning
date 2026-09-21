@@ -63,6 +63,15 @@ def get_arm_joint_slice(platform_type: str = None) -> Tuple[int, int]:
     return (c["arm_joint_start"], c["arm_joint_end"])
 
 
+def get_lower_body_joint_slice(platform_type: str = None) -> Tuple[int, int]:
+    """Get the lower-body joint range configured for a platform."""
+    platform = platform_type or DEFAULT_PLATFORM
+    c = _get_config(platform)
+    if "lower_body_joint_start" not in c or "lower_body_joint_end" not in c:
+        raise ValueError(f"Platform {platform!r} does not define lower-body joints")
+    return (c["lower_body_joint_start"], c["lower_body_joint_end"])
+
+
 # export constants for default platform
 _default = _get_config(DEFAULT_PLATFORM)
 ARM_JOINT_START = _default["arm_joint_start"]

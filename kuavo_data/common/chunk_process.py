@@ -39,6 +39,43 @@ import bisect
 logger = logging.getLogger(__name__)
 
 
+def generate_sample_timestamps(
+    raw_timestamps: List[float],
+    source_fps: int,
+    target_fps: int,
+    sample_drop: int,
+) -> Tuple[List[float], Optional[int]]:
+    """Generate timestamps while preserving the integer-ratio path.
+
+    The returned frame jump is ``None`` when fractional timestamp resampling
+    is used.
+    """
+    if source_fps <= 0 or target_fps <= 0:
+        raise ValueError("source_fps and target_fps must be positive")
+    if target_fps > source_fps:
+        raise ValueError("target_fps cannot exceed source_fps")
+    if sample_drop < 0:
+        raise ValueError("sample_drop cannot be negative")
+    if len(raw_timestamps) < 2 * sample_drop + 1:
+        raise ValueError(f"Not enough frames: {len(raw_timestamps)}")
+
+    if sample_drop > 0:
+        valid_timestamps = raw_timestamps[sample_drop:-sample_drop]
+    else:
+        valid_timestamps = raw_timestamps
+
+    if source_fps % target_fps == 0:
+        jump = source_fps // target_fps
+        return valid_timestamps[::jump], jump
+
+    start = float(valid_timestamps[0])
+    end = float(valid_timestamps[-1])
+    period = 1.0 / target_fps
+    # Integer multiplication avoids cumulative floating-point drift in long bags.
+    count = int(np.floor((end - start) * target_fps + 1e-9)) + 1
+    return [start + index * period for index in range(count)], None
+
+
 class ChunkedRosbagProcessor:
     """
     分块流式处理rosbag，实现边读取边对齐边处理
@@ -50,7 +87,7 @@ class ChunkedRosbagProcessor:
     
     def __init__(self, msg_processer, topic_process_map: dict, 
                  camera_names: list, train_hz: int, main_timeline: str, main_timeline_fps: int, 
-                 sample_drop: int):
+                 sample_drop: int, h265_cameras: set[str] | None = None):
         self._msg_processer = msg_processer
         self._topic_process_map = topic_process_map
         self.camera_names = camera_names
@@ -58,6 +95,8 @@ class ChunkedRosbagProcessor:
         self.main_timeline_fps = main_timeline_fps
         self.sample_drop = sample_drop
         self.main_timeline = main_timeline
+        self.h265_cameras = h265_cameras or set()
+        self._uses_fractional_resampling = main_timeline_fps % train_hz != 0
     
     def scan_timestamps_only(self, bag_file: str) -> Tuple[str, List[float], Dict[str, List[float]]]:
         """
@@ -104,28 +143,27 @@ class ChunkedRosbagProcessor:
             main_timeline = self.main_timeline
         logger.info(f"Main timeline: {main_timeline} ({camera_counts[main_timeline]} frames)")
         
-        # 生成对齐后的主时间戳序列
-        jump = self.main_timeline_fps // self.train_hz
-
-        # 诊断：打印每个相机的帧数和对应时长，便于排查“30秒 bag 只转出 10 秒”等问题
-        for cam, count in camera_counts.items():
-            raw_duration = (count - 2 * self.sample_drop) / self.main_timeline_fps if count > 2 * self.sample_drop else 0
-            out_frames = (count - 2 * self.sample_drop) // jump if self.sample_drop > 0 else count // jump
-            out_duration = out_frames / self.train_hz
-            logger.info(f"  Camera {cam}: {count} raw frames (~{raw_duration:.1f}s raw, ~{out_duration:.1f}s at {self.train_hz}Hz after jump={jump})")
-
         raw_timestamps = all_timestamps[main_timeline]
+        main_timestamps, jump = generate_sample_timestamps(
+            raw_timestamps,
+            self.main_timeline_fps,
+            self.train_hz,
+            self.sample_drop,
+        )
 
-        if len(raw_timestamps) < 2 * self.sample_drop + 1:
-            raise ValueError(f"Not enough frames: {len(raw_timestamps)}")
-
-        # 丢弃首尾帧，降采样
-        # 注意：当 sample_drop 为 0 时，不能使用 [self.sample_drop:-self.sample_drop]，
-        # 因为 [-0] 等价于 [0]，会导致切片结果为空。
-        if self.sample_drop > 0:
-            main_timestamps = raw_timestamps[self.sample_drop:-self.sample_drop][::jump]
-        else:
-            main_timestamps = raw_timestamps[::jump]
+        # 诊断：打印每个相机的帧数和对应时长，便于排查转换时长。
+        for cam, count in camera_counts.items():
+            raw_duration = (
+                (count - 2 * self.sample_drop) / self.main_timeline_fps
+                if count > 2 * self.sample_drop
+                else 0
+            )
+            method = f"jump={jump}" if jump is not None else "timestamp resampling"
+            logger.info(
+                f"  Camera {cam}: {count} raw frames (~{raw_duration:.1f}s raw, "
+                f"~{len(main_timestamps) / self.train_hz:.1f}s at "
+                f"{self.train_hz}Hz via {method})"
+            )
 
         out_duration_sec = len(main_timestamps) / self.train_hz
         
@@ -145,9 +183,10 @@ class ChunkedRosbagProcessor:
             f"frames: {before_len} -> {after_len}"
         )
         
+        sampling_method = f"jump={jump}" if jump is not None else "timestamp resampling"
         logger.info(f"Generated {len(main_timestamps)} aligned timestamps (~{out_duration_sec:.1f}s at {self.train_hz}Hz) "
                    f"(from {len(raw_timestamps)} raw frames, "
-                   f"dropped {self.sample_drop} frames at each end, jump={jump})")
+                   f"dropped {self.sample_drop} frames at each end, {sampling_method})")
         logger.info(f"Main timeline time range: [{main_timestamps[0]:.3f}, {main_timestamps[-1]:.3f}]")
         return main_timeline, main_timestamps, dict(all_timestamps)
     
@@ -186,7 +225,7 @@ class ChunkedRosbagProcessor:
         gripper_keys = []
         for k in self._topic_process_map.keys():
             k_lower = k.lower()
-            if 'action' in k_lower and any(kw in k_lower for kw in ['claw', 'qiangnao', 'rq2f85', 'gripper']):
+            if 'action' in k_lower and any(kw in k_lower for kw in ['claw', 'qiangnao', 'sg100', 'rq2f85', 'gripper']):
                 gripper_keys.append(k)
                 
         # 2. 维护一个跨 chunk 的状态，主要针对夹爪保持先前状态
@@ -281,34 +320,33 @@ class ChunkedRosbagProcessor:
     ) -> Dict[str, List[int]]:
         """
         预计算每个主时间戳对应的各话题索引
-        使用二分查找，比每帧都查找快很多
+        使用零阶保持（Zero-Order Hold），只取过去最近的数据，绝不拿未来的数据
         """
         alignment_indices = {}
-        
+
         for key, ts_array in timestamp_arrays.items():
             if len(ts_array) == 0:
                 alignment_indices[key] = []
                 continue
-            
+
             indices = []
             for stamp in main_timestamps:
-                # 二分查找最近的时间戳
-                idx = bisect.bisect_left(ts_array, stamp)
+                # bisect_right 找到的是第一个 *严格大于* stamp 的位置
+                idx = bisect.bisect_right(ts_array, stamp)
                 if idx == 0:
+                    # 说明当前 stamp 比 ts_array 中所有的数据都要早（未来才会来第一帧数据）
+                    # 给 0 没关系，因为你在主处理函数里有 `if main_stamp < first_ts:` 会把它设为 None 或 fallback
                     closest_idx = 0
-                elif idx == len(ts_array):
-                    closest_idx = len(ts_array) - 1
                 else:
-                    # 选择更接近的
-                    if abs(ts_array[idx] - stamp) < abs(ts_array[idx-1] - stamp):
-                        closest_idx = idx
-                    else:
-                        closest_idx = idx - 1
+                    # idx - 1 就是最后一个 *小于等于* stamp 的位置，这正是我们要的“当前或过去的最新状态”
+                    closest_idx = idx - 1
+
                 indices.append(closest_idx)
-            
+
             alignment_indices[key] = indices
-        
+
         return alignment_indices
+
     
     def _read_chunk_data(self, bag: rosbag.Bag, start_time: float, end_time: float) -> Dict[str, Dict[float, dict]]:
         """
@@ -322,6 +360,8 @@ class ChunkedRosbagProcessor:
 
         topic_to_key = {}
         for k, v in self._topic_process_map.items():
+            if k in self.h265_cameras:
+                continue
             if v["topic"] not in topic_to_key.keys():
                 topic_to_key[v["topic"]] = [k]
             else:
@@ -378,6 +418,10 @@ class ChunkedRosbagProcessor:
         aligned_frame = {"timestamp": main_stamp}
         
         for key in self._topic_process_map.keys():
+            if key in self.h265_cameras:
+                aligned_frame[key] = None
+                continue
+
             is_gripper = key in gripper_keys
 
             # 从timestamp_arrays获取对应的时间戳异常处理

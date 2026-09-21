@@ -1,0 +1,89 @@
+# Roban wholebody LeRobot mapping for LingBot-VLA v2.
+# Flat layouts match kuavo_data/modality_templates/roban_wholebody_modality.json:
+#   state  23D = left_arm4 + left_hand1 + right_arm4 + right_hand1 + left_leg6 + right_leg6 + waist1
+#   action 32D = state 23D + root_xyz3 + root_rot6d6
+# Dataset cameras: observation.images.head_cam_h only.
+
+states:
+  - observation.state.arm.position:
+      origin_keys:
+        - observation.state:
+            start: 0
+            end: 4
+        - observation.state:
+            start: 5
+            end: 9
+  - observation.state.effector.position:
+      origin_keys:
+        - observation.state:
+            start: 4
+            end: 5
+        - observation.state:
+            start: 9
+            end: 10
+  - observation.state.leg.position:
+      origin_keys:
+        - observation.state:
+            start: 10
+            end: 16
+        - observation.state:
+            start: 16
+            end: 22
+  - observation.state.waist.position:
+      origin_keys:
+        - observation.state:
+            start: 22
+            end: 23
+
+actions:
+  - action.arm.position:
+      origin_keys:
+        - action:
+            start: 0
+            end: 4
+        - action:
+            start: 5
+            end: 9
+      subtract_state: false
+  - action.effector.position:
+      origin_keys:
+        - action:
+            start: 4
+            end: 5
+        - action:
+            start: 9
+            end: 10
+      subtract_state: false
+  - action.leg.position:
+      origin_keys:
+        - action:
+            start: 10
+            end: 16
+        - action:
+            start: 16
+            end: 22
+      subtract_state: false
+  - action.waist.position:
+      origin_keys:
+        - action:
+            start: 22
+            end: 23
+      subtract_state: false
+  - action.root_xyz.position:
+      origin_keys:
+        - action:
+            start: 23
+            end: 26
+      subtract_state: false
+  - action.root_rot6d.position:
+      origin_keys:
+        - action:
+            start: 26
+            end: 32
+      subtract_state: false
+
+images:
+  - observation.images.head_cam_h:
+      origin_keys: observation.images.head_cam_h
+
+norm_stats: assets/norm_stats/roban_wholebody.json

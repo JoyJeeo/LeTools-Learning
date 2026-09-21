@@ -1,0 +1,45 @@
+states:
+  - observation.state.arm.position:
+      origin_keys:
+        - observation.state:
+            start: 0
+            end: 7
+        - observation.state:
+            start: 18
+            end: 25
+  - observation.state.effector.position:
+      origin_keys:
+        - observation.state:
+            start: 7
+            end: 18
+        - observation.state:
+            start: 25
+            end: 36
+
+actions:
+  - action.arm.position:
+      origin_keys:
+        - action:
+            start: 0
+            end: 7
+        - action:
+            start: 18
+            end: 25
+      subtract_state: true
+  - action.effector.position:
+      origin_keys:
+        - action:
+            start: 7
+            end: 18
+        - action:
+            start: 25
+            end: 36
+      subtract_state: false
+
+images:
+  - observation.images.head_cam_h:
+      origin_keys: observation.images.head_cam_h
+  - observation.images.wrist_cam_l:
+      origin_keys: observation.images.wrist_cam_l
+  - observation.images.wrist_cam_r:
+      origin_keys: observation.images.wrist_cam_r

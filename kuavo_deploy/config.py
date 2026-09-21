@@ -33,6 +33,20 @@ def get_arm_joint_slice(platform_type: str) -> Tuple[int, int]:
         )
     return (platform["arm_joint_start"], platform["arm_joint_end"])
 
+
+def get_lower_body_joint_slice(platform_type: str) -> Tuple[int, int]:
+    config_file = (
+        Path(__file__).resolve().parent.parent / "configs" / "platform" / "platform_config.yaml"
+    )
+    with open(config_file, "r", encoding="utf-8") as f:
+        platform_cfg = yaml.safe_load(f) or {}
+    platform = platform_cfg.get("platforms", {}).get(platform_type.lower())
+    if not platform:
+        raise ValueError(f"Unsupported platform type: {platform_type}")
+    if "lower_body_joint_start" not in platform or "lower_body_joint_end" not in platform:
+        raise ValueError(f"Platform {platform_type!r} does not define lower-body joints")
+    return (platform["lower_body_joint_start"], platform["lower_body_joint_end"])
+
 @dataclass
 class Range:
     min: List[float]
@@ -42,20 +56,7 @@ class Range:
 class LimitsConfig:
     joint_q: Range = field(default_factory=lambda: Range([-3.14]*14, [3.14]*14))
     gripper: Range = field(default_factory=lambda: Range([0, 0], [1, 1]))
-    eef: Range = field(default_factory=lambda: Range(
-        [-1, -1, -1, -3.14, -3.14, -3.14,
-         -1, -1, -1, -3.14, -3.14, -3.14],
-        [1, 1, 1, 3.14, 3.14, 3.14,
-         1, 1, 1, 3.14, 3.14, 3.14]
-    ))
-    eef_relative: Range = field(default_factory=lambda: Range(
-        [-0.005, -0.0075, -0.004, -0.03, -0.03, -0.05,
-         -0.005, -0.0075, -0.004, -0.03, -0.03, -0.05],
-        [0.005, 0.0075, 0.004, 0.03, 0.03, 0.05,
-         0.005, 0.0075, 0.004, 0.03, 0.03, 0.05]
-    ))
-    base: Range = field(default_factory=lambda: Range([-2.0, -2.0, -3.14, 0],
-                                                      [2.0, 2.0, 3.14, 1]))
+    lower_body: Range = field(default_factory=lambda: Range([-3.14]*4, [3.14]*4))
 
 # -----------------------
 # Environment Dataclass
@@ -65,14 +66,14 @@ class ConfigEnv:
     inference_env: str = "real"  # "sim" or "real"
     env_name: str = "Kuavo-Sim"
     real: bool = False
-    only_arm: bool = True
     eef_type: str = "rq2f85"
     platform_type: str = "4pro"
+    enable_5w_wholebody: bool = False
+    enable_5w_base_move: bool = False
+    lowerlock_5w: List[int] = field(default_factory=lambda: [0, 0, 0, 0])
     control_mode: str = "joint"
     which_arm: str = "both"
     head_init: Optional[List[float]] = field(default_factory=lambda: [0.0, 0.0])
-    use_delta: bool = False
-    delta_type: str = "Tsub"  # "Tsub","Tinv","RPY"
     ros_rate: int = 10
     control_rate: int = 100  # WBC/插值后的实际控制指令频率
     enable_action_interpolation: bool = True
@@ -84,38 +85,108 @@ class ConfigEnv:
     ratio: float = 0.5
     frame_alignment: bool = True
     qiangnao_dof_needed: int = 1
+    sg100_dof_needed: int = 1
+    sg100_dof_offset: int = 0
+    sg100_open_pose: List[float] = field(default_factory=lambda: [0.0] * 22)
+    sg100_close_pose: List[float] = field(default_factory=lambda: [1.57] * 22)
+    sg100_init_pose: List[float] = field(default_factory=lambda: [0.0] * 22)
+    sg100_force_threshold: float = 0.5
+    sg100_force_kp: List[float] = field(default_factory=lambda: [0.5] * 22)
+    sg100_force_kd: List[float] = field(default_factory=lambda: [0.05] * 22)
+    sg100_force_torque_ff: List[float] = field(default_factory=lambda: [0.0] * 22)
+    sg100_force_output_limit: List[float] = field(default_factory=lambda: [1.0] * 22)
+    sg100_force_velocities: List[float] = field(default_factory=lambda: [0.0] * 22)
+    is_binary_sg100_action: bool = False
+    sg100_action_threshold: float = 0.5
 
-    fk_joint_angles_for_reset: Optional[List[float]] = None
-    rotation_threshold: Optional[float] = None
-    
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     is_binary: bool = False
+    camera_encoding: str = "jpeg"  # "jpeg" or "h265"
 
     # -------- Validation ----------
     def validate(self):
+        if (not isinstance(self.lowerlock_5w, list)
+                or len(self.lowerlock_5w) != 4
+                or any(type(value) is not int or value not in (0, 1)
+                       for value in self.lowerlock_5w)):
+            raise ValueError("env.5w_lowerlock must be a four-element array of 0 or 1")
         if self.inference_env not in ["sim", "real"]:
             raise ValueError("env.inference_env must be 'sim' or 'real'")
-        if self.eef_type not in ["rq2f85", "leju_claw", "qiangnao"]:
-            raise ValueError(f"Invalid eef_type: {self.eef_type}. Valid: rq2f85, leju_claw, qiangnao")
+        if self.eef_type not in ["rq2f85", "leju_claw", "qiangnao", "sg100"]:
+            raise ValueError(f"Invalid eef_type: {self.eef_type}. Valid: rq2f85, leju_claw, qiangnao, sg100")
         if self.platform_type not in ["4pro", "5w", "5"]:
             raise ValueError(f"Invalid platform_type: {self.platform_type}. Valid: 4pro, 5w, 5")
         if self.which_arm not in ["left", "right", "both"]:
             raise ValueError(f"Invalid which_arm: {self.which_arm}. Valid: left, right, both")
         if not isinstance(self.image_size, list) or len(self.image_size) != 2:
             raise ValueError("image_size must be a list [height, width]")
-        # ensure lists lengths for arm bounds
-        if not (len(self.limits["joint_q"]["max"]) == len(self.limits["joint_q"]["min"]) == 14):
-            raise ValueError("Robot arm_min/arm_max must be lists of length 14")
+        if self.camera_encoding not in ["jpeg", "h265"]:
+            raise ValueError(f"Invalid camera_encoding: {self.camera_encoding}. Valid: jpeg, h265")
+        # Derive dimensions from the platform/config instead of a packed 16D assumption.
+        arm_start, arm_end = get_arm_joint_slice(self.platform_type)
+        arm_dof = arm_end - arm_start
+        if len(self.limits["joint_q"]["max"]) != len(self.limits["joint_q"]["min"]):
+            raise ValueError("joint_q min/max must have equal lengths")
+        if len(self.limits["joint_q"]["min"]) != arm_dof:
+            raise ValueError(f"Robot joint_q limits must contain {arm_dof} arm joints")
+        if len(self.limits["gripper"]["max"]) != len(self.limits["gripper"]["min"]):
+            raise ValueError("gripper min/max must have equal lengths")
+        if len(self.limits["gripper"]["min"]) % 2:
+            raise ValueError("gripper limits must contain equal left/right dimensions")
+        if self.use_5w_wholebody:
+            lower_start, lower_end = get_lower_body_joint_slice(self.platform_type)
+            lower_dof = lower_end - lower_start
+            lower_limits = self.limits["lower_body"]
+            if not (len(lower_limits["min"]) == len(lower_limits["max"]) == lower_dof):
+                raise ValueError(f"lower_body min/max must each contain {lower_dof} values")
         if self.qiangnao_dof_needed != 1: # not in [1, 7]:
             raise ValueError("qiangnao_dof_needed must be 1 now!")
             # raise ValueError("qiangnao_dof_needed must be either 1 or 7")
+        if self.sg100_dof_needed not in (1, 11):
+            raise ValueError("sg100_dof_needed must be 1 or 11")
+        if not isinstance(self.sg100_dof_offset, int) or self.sg100_dof_offset < 0:
+            raise ValueError("sg100_dof_offset must be a non-negative integer")
+        if self.sg100_dof_offset + self.sg100_dof_needed > 11:
+            raise ValueError("sg100_dof_offset + sg100_dof_needed must be <= 11")
+        for name in (
+            "sg100_open_pose", "sg100_close_pose", "sg100_init_pose",
+            "sg100_force_kp", "sg100_force_kd", "sg100_force_torque_ff",
+            "sg100_force_output_limit", "sg100_force_velocities",
+        ):
+            if len(getattr(self, name)) != 22:
+                raise ValueError(f"{name} must contain 22 values (11 left + 11 right)")
+        if not 0.0 <= self.sg100_force_threshold <= 1.0:
+            raise ValueError("sg100_force_threshold must be in [0, 1]")
+        if not 0.0 <= self.sg100_action_threshold <= 1.0:
+            raise ValueError("sg100_action_threshold must be in [0, 1]")
 
     # -------- Derived properties ----------
     @property
-    def joint_q_slice(self):
-        
+    def use_5w_wholebody(self) -> bool:
+        return self.platform_type.lower() == "5w" and self.enable_5w_wholebody
+
+    @property
+    def use_5w_base_move(self) -> bool:
+        return self.platform_type.lower() == "5w" and self.enable_5w_base_move
+
+    @property
+    def arm_dof_per_side(self) -> int:
         arm_start, arm_end = get_arm_joint_slice(self.platform_type)
-        left_end = arm_start + 7
+        arm_dof = arm_end - arm_start
+        if arm_dof % 2:
+            raise ValueError("The configured arm joint range must split evenly between both arms")
+        return arm_dof // 2
+
+    @property
+    def eef_dof_per_side(self) -> int:
+        if self.eef_type == "sg100":
+            return self.sg100_dof_needed
+        return len(self.limits["gripper"]["min"]) // 2
+
+    @property
+    def joint_q_slice(self):
+        arm_start, arm_end = get_arm_joint_slice(self.platform_type)
+        left_end = arm_start + self.arm_dof_per_side
         right_start = left_end
         return {
             "left": [[arm_start, left_end]],
@@ -126,10 +197,11 @@ class ConfigEnv:
     @property
     def gripper_slice(self):
         if self.eef_type == "rq2f85" or self.eef_type == "leju_claw":
+            dof = self.eef_dof_per_side
             return {
-                "left": [[0, 1]],
-                "right": [[1, 2]],
-                "both": [[0, 1], [1, 2]]
+                "left": [[0, dof]],
+                "right": [[dof, dof * 2]],
+                "both": [[0, dof], [dof, dof * 2]]
             }[self.which_arm]
         elif self.eef_type == "qiangnao" and self.qiangnao_dof_needed == 1:
             return {
@@ -137,10 +209,24 @@ class ConfigEnv:
                 "right": [[6, 7]],
                 "both": [[0, 1], [6, 7]]
             }[self.which_arm]
+        elif self.eef_type == "sg100":
+            offset = self.sg100_dof_offset
+            count = self.sg100_dof_needed
+            return {
+                "left": [[offset, offset + count]],
+                "right": [[11 + offset, 11 + offset + count]],
+                "both": [[offset, offset + count], [11 + offset, 11 + offset + count]],
+            }[self.which_arm]
         else:
             raise ValueError("Unsupported eef_type or dof config")
 
     # ---------------- obs_key_map build ----------------
+    _H265_TOPIC_MAP = {
+        "head_cam_h": "/cam_h/color/h265_stream",
+        "wrist_cam_l": "/cam_l/color/h265_stream",
+        "wrist_cam_r": "/cam_r/color/h265_stream",
+    }
+
     def build_obs_key_map(self) -> Dict[str, Any]:
         obs_map = {}
         for key, info in self.obs_key_map.items():
@@ -160,7 +246,7 @@ class ConfigEnv:
             # 特殊键处理
             if key == "joint_q":
                 base["handle"]["params"]["slice"] = self.joint_q_slice
-            if key in ["rq2f85", "qiangnao", "leju_claw"]:
+            if key in ["rq2f85", "qiangnao", "leju_claw", "sg100"]:
                 base["handle"]["params"]["slice"] = self.gripper_slice
                 obs_map["gripper"] = base
                 continue
@@ -172,6 +258,21 @@ class ConfigEnv:
                 }
                 continue
             obs_map[key] = base
+
+        if self.camera_encoding == "h265":
+            for key, obs_info in obs_map.items():
+                if key in self._H265_TOPIC_MAP:
+                    obs_info["topic"] = self._H265_TOPIC_MAP[key]
+                    obs_info["h265"] = True
+
+        if self.use_5w_wholebody:
+            joint_info = obs_map.get("joint_q")
+            if joint_info is None:
+                raise ValueError("5w_wholebody requires joint_q in env.obs_key_map")
+            lower_start, lower_end = get_lower_body_joint_slice(self.platform_type)
+            lower_info = deepcopy(joint_info)
+            lower_info["handle"]["params"]["slice"] = [[lower_start, lower_end]]
+            obs_map["lower_body"] = lower_info
         return obs_map
 
 
@@ -374,8 +475,8 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
             env_cfg["real"] = True
             env_cfg.setdefault("platform_type", "4pro")
             env_cfg.setdefault("eef_type", "leju_claw")
-            if env_cfg["eef_type"] not in {"leju_claw", "qiangnao"}:
-                raise ValueError("When inference_env=real, eef_type must be 'leju_claw' or 'qiangnao'")
+            if env_cfg["eef_type"] not in {"leju_claw", "qiangnao", "sg100"}:
+                raise ValueError("When inference_env=real, eef_type must be 'leju_claw', 'qiangnao', or 'sg100'")
             env_cfg["head_init"] = None
             env_cfg["image_size"] = [848, 480]
 
@@ -399,7 +500,7 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
                 continue
             if key == "depth_r" and which_arm == "left":
                 continue
-            if key in {"rq2f85", "leju_claw", "qiangnao"} and key != eef_type:
+            if key in {"rq2f85", "leju_claw", "qiangnao", "sg100"} and key != eef_type:
                 continue
             filtered[key] = value
         env_cfg["obs_key_map"] = filtered
@@ -423,6 +524,18 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
     cfg = _apply_inference_env_defaults(cfg)
     cfg = _resolve_template(cfg, cfg)
     cfg = _filter_obs_key_map_for_eef(cfg)
+
+    # YAML keeps the user-facing option name requested for 5W, while the
+    # dataclass uses a valid Python identifier internally.
+    for option_key, field_name in (
+        ("5w_wholebody", "enable_5w_wholebody"),
+        ("5w_base_move", "enable_5w_base_move"),
+        ("5w_lowerlock", "lowerlock_5w"),
+    ):
+        if isinstance(cfg.get("env"), dict) and option_key in cfg["env"]:
+            cfg["env"][field_name] = cfg["env"].pop(option_key)
+        elif option_key in cfg:
+            cfg[field_name] = cfg.pop(option_key)
 
     # The user's original YAML was mostly top-level keys (not nested under env/inference).
     # We'll support both styles:
@@ -451,9 +564,7 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
                 env_cfg["limits"] = LimitsConfig(
                     joint_q=dict_to_range(v.get("joint_q", {})),
                     gripper=dict_to_range(v.get("gripper", {})),
-                    eef=dict_to_range(v.get("eef", {})),
-                    eef_relative=dict_to_range(v.get("eef_relative", {})),
-                    base=dict_to_range(v.get("base", {})),
+                    lower_body=dict_to_range(v.get("lower_body", {})),
                 )
             else:
                 env_cfg[k] = v
@@ -462,6 +573,13 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
     default_inf = ConfigInference()
 
     merged_env = {**asdict(default_env), **env_cfg}
+    if isinstance(env_cfg.get("limits"), dict):
+        merged_env["limits"] = _deep_merge(asdict(default_env.limits), env_cfg["limits"])
+    if merged_env["eef_type"] == "sg100" and merged_env["sg100_dof_needed"] == 11:
+        for bound in ("min", "max"):
+            values = merged_env["limits"]["gripper"][bound]
+            if len(values) == 2:
+                merged_env["limits"]["gripper"][bound] = [values[0]] * 11 + [values[1]] * 11
     merged_inf = {**asdict(default_inf), **inf_cfg}
 
     env = ConfigEnv(**merged_env)

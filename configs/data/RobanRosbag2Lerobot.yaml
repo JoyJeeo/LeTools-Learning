@@ -1,0 +1,34 @@
+hydra:
+  run:
+    dir: ./outputs/data_cvt_hydra_save/singlerun/${now:%Y%m%d_%H%M%S}
+  sweep:
+    dir: ./outputs/data_cvt_hydra_save/multirun/${now:%Y%m%d_%H%M%S}
+    subdir: ${hydra:job.override_dirname}
+
+# Roban ROS1 bag -> LeRobot dataset v3.0
+rosbag:
+  mode: normal  # normal, resume, merge
+  rosbag_dir: /path/to/rosbag
+  target_dir: /path/to/lerobot  # 数据写入 target_dir/lerobot
+  lerobot_dir_resume: /path/to/lerobot_resume
+  lerobot_dir_merge:
+    - /path/to/lerobot1
+    - /path/to/lerobot2
+  chunk_size: 100
+  parallel: false  # true 时 rosbag 数据分片并行转换,可加速数据转换，但需要更多内存，仅 normal 模式生效
+  parallel_workers: 4  # 并行进程数，建议使用4，若内存不足，可以适当减小该值
+
+dataset:
+  platform_type: roban
+  task_description: "robot manipulation"
+  train_hz: 50
+  main_timeline: head_cam_h
+  main_timeline_fps: 60
+  sample_drop: 10
+
+  resize:
+    width: 640
+    height: 480
+
+  topics:
+    camera: /cam_h/color/image_raw/compressed

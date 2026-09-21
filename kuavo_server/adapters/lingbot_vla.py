@@ -35,6 +35,19 @@ def _resolve_required_path(path: str, argument: str, *, directory: bool) -> Path
     return resolved
 
 
+def _feature_source_dim(config_path: Path, section: str) -> int:
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    ends = []
+    for feature in config.get(section, []):
+        for spec in feature.values():
+            for source in spec.get("origin_keys", []):
+                for source_spec in source.values():
+                    ends.append(int(source_spec["end"]))
+    if not ends:
+        raise ValueError(f"No origin_keys found in {section!r} of {config_path}")
+    return max(ends)
+
+
 def _resolve_training_config_path(lingbot_root: Path, training_config_path: str) -> Path:
     if training_config_path:
         return _resolve_required_path(training_config_path, "--training_config_path", directory=False)
@@ -48,10 +61,11 @@ def _resolve_training_config_path(lingbot_root: Path, training_config_path: str)
     return default_path
 
 
-def _resolve_robot_config_path(robot_config_path: str) -> Path:
+def _resolve_robot_config_path(robot_config_path: str, eef_dof: int) -> Path:
     if robot_config_path:
         return _resolve_required_path(robot_config_path, "--robot_config_path", directory=False)
-    return Path(__file__).resolve().parents[1] / "configs" / "lingbotvla" / "kuavo.yaml"
+    filename = "kuavo_sg100.yaml" if eef_dof == 11 else "kuavo.yaml"
+    return Path(__file__).resolve().parents[1] / "configs" / "lingbotvla" / filename
 
 
 def _to_numpy(x: Any) -> np.ndarray:
@@ -148,6 +162,7 @@ class LingBotVlaAdapter(ModelServerAdapter):
         checkpoint: str,
         model_repo_root: str,
         which_arm: str,
+        eef_dof: int,
         execution_horizon: int,
         qwen25_path: str,
         training_config_path: str,
@@ -161,6 +176,7 @@ class LingBotVlaAdapter(ModelServerAdapter):
             raise ValueError("--execution_horizon must be -1 or a positive integer.")
 
         self.which_arm = which_arm
+        self.eef_dof = eef_dof
         self.execution_horizon = execution_horizon
         self.checkpoint = _resolve_required_path(checkpoint, "--checkpoint", directory=True)
         if not (self.checkpoint / "config.json").is_file():
@@ -168,7 +184,8 @@ class LingBotVlaAdapter(ModelServerAdapter):
         self.model_repo_root = _resolve_lingbot_root(model_repo_root)
         self.qwen25_path = _resolve_required_path(qwen25_path, "--qwen25_path", directory=True)
         self.training_config_path = _resolve_training_config_path(self.model_repo_root, training_config_path)
-        self.robot_config_path = _resolve_robot_config_path(robot_config_path)
+        self.robot_config_path = _resolve_robot_config_path(robot_config_path, eef_dof)
+        self.expected_action_dim = _feature_source_dim(self.robot_config_path, "actions")
         self.robot_norm_path = _resolve_required_path(robot_norm_path, "--robot_norm_path", directory=False)
         self._pending_actions: list[np.ndarray] = []
 
@@ -222,6 +239,7 @@ class LingBotVlaAdapter(ModelServerAdapter):
         )
         parser.add_argument("--qwen25_path", type=str, required=True, help="Path to Qwen2.5-VL tokenizer/model dir")
         parser.add_argument("--which_arm", type=str, default="both", choices=["left", "right", "both"])
+        parser.add_argument("--eef_dof", type=int, default=1, choices=[1, 11])
         parser.add_argument("--execution_horizon", type=int, default=25, help="-1 returns the model's full chunk")
         parser.add_argument("--num_denoising_step", type=int, default=10)
         parser.add_argument("--use_compile", action="store_true")
@@ -233,6 +251,7 @@ class LingBotVlaAdapter(ModelServerAdapter):
             checkpoint=args.checkpoint,
             model_repo_root=args.model_repo_root,
             which_arm=args.which_arm,
+            eef_dof=args.eef_dof,
             execution_horizon=args.execution_horizon,
             qwen25_path=args.qwen25_path,
             training_config_path=args.training_config_path,
@@ -248,6 +267,7 @@ class LingBotVlaAdapter(ModelServerAdapter):
             "status": "ok",
             "adapter": self.name,
             "which_arm": self.which_arm,
+            "eef_dof": self.eef_dof,
             "checkpoint": str(self.checkpoint),
             "model_repo_root": str(self.model_repo_root),
             "runtime_model_path": self.runtime_model_path,
@@ -291,14 +311,16 @@ class LingBotVlaAdapter(ModelServerAdapter):
 
     def _convert_action(self, action: Any) -> np.ndarray:
         action_np = _to_numpy(action).reshape(-1).astype(np.float64)
-        if action_np.shape[0] == 16:
+        full_dim = 14 + 2 * self.eef_dof
+        single_dim = 7 + self.eef_dof
+        if action_np.shape[0] == full_dim:
             if self.which_arm == "both":
                 return action_np
             if self.which_arm == "left":
-                return np.concatenate([action_np[:7], action_np[7:8]])
+                return action_np[:single_dim]
             if self.which_arm == "right":
-                return np.concatenate([action_np[8:15], action_np[15:16]])
-        if action_np.shape[0] == 8 and self.which_arm in ("left", "right"):
+                return action_np[single_dim:full_dim]
+        if action_np.shape[0] == self.expected_action_dim:
             return action_np
         raise ValueError(f"Unsupported action shape {action_np.shape} for which_arm={self.which_arm}")
 

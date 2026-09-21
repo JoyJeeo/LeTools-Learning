@@ -47,7 +47,9 @@ def cleanup(signum, frame):
         print(f"⏹️ 正在终止任务 (PID: {current_proc.pid})...")
         current_proc.terminate()
         try:
-            current_proc.wait(timeout=3)
+            # Wholebody shutdown may retry a five-second controller switch
+            # before clearing buffers and closing DDS.
+            current_proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             current_proc.kill()
         print("✅ 任务已终止")
@@ -96,7 +98,7 @@ def input_listener(input_queue, stop_event):
             # print("line: ", line)  # 换行
             input_queue.put(line.strip().lower())
 
-def interactive_controller():
+def interactive_controller(stop_timeout=3):
     global current_proc, LOG_DIR
 
     print("🎮 交互式控制器已启动")
@@ -145,11 +147,13 @@ def interactive_controller():
         elif cmd in ("s", "stop"):
             print("⏹️  发送停止信号...")
             os.kill(current_proc.pid, signal.SIGUSR2)
+            forced = False
             try:
-                current_proc.wait(timeout=3)
+                current_proc.wait(timeout=stop_timeout)
             except subprocess.TimeoutExpired:
                 current_proc.kill()
-            print("✅ 任务已强制停止")
+                forced = True
+            print("✅ 任务已强制停止" if forced else "✅ 任务已安全停止")
             stop_event.set()
             break
 
@@ -178,6 +182,18 @@ def parse_config(config_path):
         with open(config_path, "r") as f:
             cfg = yaml.safe_load(f)
         inf = cfg.get("inference", {})
+        policy_type = str(inf.get("policy_type", "")).strip()
+
+        print("📋 模型配置信息:")
+        if policy_type == "client":
+            print("   🔌 推理模式: Client（外置模型服务）")
+            server_host = str(inf.get("server_host", "")).strip()
+            server_port = inf.get("server_port")
+            if server_host and server_port is not None:
+                print(f"   🌐 服务地址: {server_host}:{server_port}")
+            print("   ℹ️ Client 模式无需配置本地模型路径")
+            return cfg
+
         pretrained_path = inf.get("pretrained_path", "")
         task = inf.get("task", "N/A")
         method = inf.get("method", "N/A")
@@ -188,7 +204,6 @@ def parse_config(config_path):
             model_path = Path(pretrained_path)
         else:
             model_path = Path(f"outputs/train/{task}/{method}/{timestamp}/epoch{epoch}")
-        print("📋 模型配置信息:")
         if pretrained_path:
             print(f"   Pretrained Path: {pretrained_path}")
         else:
@@ -246,6 +261,47 @@ def print_task_menu(config_path="<config_path>", use_color=True):
     print(f"{YELLOW}  python kuavo_deploy/offline_bag_eval.py --config {config_path} --bag <bag_path> --plot{RESET}")
 
 
+def is_roban_config(cfg):
+    """Keep the existing Kuavo entry unchanged unless Roban is explicit."""
+    platform_type = cfg.get("platform_type")
+    if platform_type is None and isinstance(cfg.get("env"), dict):
+        platform_type = cfg["env"].get("platform_type")
+    return str(platform_type).strip().lower() == "roban"
+
+
+def run_roban_wholebody_menu(config_path, runner_path):
+    """Wholebody HEFT deployment intentionally has no bag replay path."""
+    global current_proc, LOG_DIR
+
+    while True:
+        print("\n🟢 Roban Wholebody 可选择的任务:")
+        print("1. run : 运行 HEFT wholebody 模型推理")
+        print("2. 退出")
+        choice = input("请选择要执行的任务 (1-2): ").strip()
+        if choice == "2":
+            return
+        if choice != "1":
+            print(f"❌ 无效选择: {choice}")
+            continue
+
+        cmd = [
+            "python3",
+            "-u",
+            str(runner_path),
+            "--task",
+            "run",
+            "--config",
+            config_path,
+        ]
+        log_path = LOG_DIR / "kuavo_deploy.log"
+        with open(log_path, "w") as log_file:
+            current_proc = subprocess.Popen(
+                cmd, stdout=log_file, stderr=subprocess.STDOUT
+            )
+        print(f"任务已启动，PID: {current_proc.pid}")
+        interactive_controller(stop_timeout=15)
+
+
 
 # ========== 主逻辑 ==========
 def main():
@@ -289,7 +345,17 @@ def main():
         print(f"❌ 配置文件不存在: {config_path}")
         sys.exit(1)
 
-    parse_config(config_path)
+    cfg = parse_config(config_path)
+
+    if is_roban_config(cfg):
+        wholebody_runner = (
+            script_dir / "roban_wholebody_deploy" / "runner.py"
+        )
+        if not wholebody_runner.exists():
+            print(f"错误: 找不到 Roban wholebody runner: {wholebody_runner}")
+            sys.exit(1)
+        run_roban_wholebody_menu(config_path, wholebody_runner)
+        return
 
     while True:
         print_task_menu(config_path=config_path, use_color=True)

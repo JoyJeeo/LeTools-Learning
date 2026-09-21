@@ -16,6 +16,8 @@ platforms:
     name: "Kuavo 5W"
     arm_joint_start: 4
     arm_joint_end: 18
+    lower_body_joint_start: 0
+    lower_body_joint_end: 4
     description: "5W: 手臂关节索引范围 [4:18] (14个关节，左右各7个)"
   
   "5":

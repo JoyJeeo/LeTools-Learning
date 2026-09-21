@@ -73,12 +73,16 @@ def _patch_data_config_from_deploy(data_cfg, config: KuavoConfig):
     inf = config.inference
 
     data_cfg.dataset.platform_type = env.platform_type
+    data_cfg.dataset["5w_wholebody"] = env.use_5w_wholebody
+    data_cfg.dataset["5w_base_move"] = env.use_5w_base_move
     data_cfg.dataset.eef_type = env.eef_type
     data_cfg.dataset.which_arm = env.which_arm
     data_cfg.dataset.depth_range = list(env.depth_range)
-    data_cfg.dataset.dex_dof_needed = env.qiangnao_dof_needed
+    data_cfg.dataset.dex_dof_needed = (
+        env.sg100_dof_needed if env.eef_type == "sg100" else env.qiangnao_dof_needed
+    )
+    data_cfg.dataset.dex_dof_offset = env.sg100_dof_offset if env.eef_type == "sg100" else 0
     data_cfg.dataset.is_binary = env.is_binary
-    data_cfg.dataset.delta_action = env.use_delta
     data_cfg.dataset.train_hz = env.ros_rate
     data_cfg.dataset.task_description = inf.task_prompt or "robot manipulation"
 
@@ -113,7 +117,7 @@ def _load_bag_frames(
     from omegaconf import OmegaConf
 
     from kuavo_data.common import kuavo_dataset as kuavo
-    from kuavo_data.common.config_platform import get_arm_joint_slice
+    from kuavo_data.common.config_platform import get_arm_joint_slice, get_lower_body_joint_slice
 
     data_cfg = OmegaConf.load(data_config_path)
     data_cfg = _patch_data_config_from_deploy(data_cfg, config)
@@ -141,16 +145,20 @@ def _load_bag_frames(
     def _hand_pair(
         *,
         state: np.ndarray,
-        action: np.ndarray,
+        arm_action: np.ndarray,
         claw_state: np.ndarray,
         claw_action: np.ndarray,
         qiangnao_state: np.ndarray,
         qiangnao_action: np.ndarray,
+        sg100_state: np.ndarray,
+        sg100_action: np.ndarray,
         hand_side: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         robot_slice = kuavo.SLICE_ROBOT[hand_side]
         arm_state = state[robot_slice[0] : robot_slice[-1]]
-        arm_action = action[robot_slice[0] : robot_slice[-1]]
+        arm_dof_per_side = arm_action.size // 2
+        arm_start = hand_side * arm_dof_per_side
+        selected_arm_action = arm_action[arm_start : arm_start + arm_dof_per_side]
 
         if kuavo.USE_LEJU_CLAW:
             claw_slice = kuavo.SLICE_CLAW[hand_side]
@@ -160,12 +168,16 @@ def _load_bag_frames(
             dex_slice = kuavo.SLICE_DEX[hand_side]
             eef_state = qiangnao_state[dex_slice[0] : dex_slice[-1]]
             eef_action = qiangnao_action[dex_slice[0] : dex_slice[-1]]
+        elif kuavo.USE_SG100:
+            dex_slice = kuavo.SLICE_DEX[hand_side]
+            eef_state = sg100_state[dex_slice[0] : dex_slice[-1]]
+            eef_action = sg100_action[dex_slice[0] : dex_slice[-1]]
         else:
-            raise ValueError("Only leju_claw, rq2f85 and qiangnao end effectors are supported.")
+            raise ValueError("Only leju_claw, rq2f85, qiangnao and sg100 end effectors are supported.")
 
         return (
             np.concatenate((arm_state, eef_state)).astype(np.float32),
-            np.concatenate((arm_action, eef_action)).astype(np.float32),
+            np.concatenate((selected_arm_action, eef_action)).astype(np.float32),
         )
 
     def on_frame(aligned_frame: dict[str, Any], frame_idx: int) -> None:
@@ -175,45 +187,44 @@ def _load_bag_frames(
             return
 
         state = _array(aligned_frame, "observation.state")
-        action = _array(aligned_frame, "action")
         arm_traj = _array(aligned_frame, "action.kuavo_arm_traj")
-        if state.size == 0 or action.size == 0 or arm_traj.size == 0:
+        arm_dof = arm_end - arm_start
+        if state.size == 0 or arm_traj.size != arm_dof:
             return
-
-        action = action.copy()
-        action[arm_start:arm_end] = arm_traj
 
         if first_raw_state is None:
             first_raw_state = state.copy()
         if first_raw_action is None:
-            first_raw_action = action.copy()
+            first_raw_action = arm_traj.copy()
 
         if kuavo.RELATIVE_START:
             state = state - first_raw_state
-            action = action - first_raw_action
-        if kuavo.DELTA_ACTION:
-            action = action - state
+            arm_traj = arm_traj - first_raw_action
 
         claw_state = _array(aligned_frame, "observation.claw")
         claw_action = _array(aligned_frame, "action.claw")
         qiangnao_state = _array(aligned_frame, "observation.qiangnao")
         qiangnao_action = _array(aligned_frame, "action.qiangnao")
+        sg100_state = _array(aligned_frame, "observation.sg100")
+        sg100_action = _array(aligned_frame, "action.sg100")
         rq2f85_state = _array(aligned_frame, "observation.rq2f85")
         rq2f85_action = _array(aligned_frame, "action.rq2f85")
 
-        if claw_state.size == 0 and qiangnao_state.size == 0 and rq2f85_state.size == 0:
+        if claw_state.size == 0 and qiangnao_state.size == 0 and sg100_state.size == 0 and rq2f85_state.size == 0:
             return
-        if claw_action.size == 0 and qiangnao_action.size == 0 and rq2f85_action.size == 0:
+        if claw_action.size == 0 and qiangnao_action.size == 0 and sg100_action.size == 0 and rq2f85_action.size == 0:
             return
 
         claw_state = _normalize_binary_or_range(claw_state, binary_threshold=50, scale=100)
         claw_action = _normalize_binary_or_range(claw_action, binary_threshold=50, scale=100)
         qiangnao_state = _normalize_binary_or_range(qiangnao_state, binary_threshold=50, scale=100)
         qiangnao_action = _normalize_binary_or_range(qiangnao_action, binary_threshold=50, scale=100)
+        sg100_state = _normalize_binary_or_range(sg100_state, binary_threshold=0.785, scale=1.57)
+        sg100_action = _normalize_binary_or_range(sg100_action, binary_threshold=0.785, scale=1.57)
         rq2f85_state = _normalize_binary_or_range(rq2f85_state, binary_threshold=0.4, scale=0.8)
         rq2f85_action = _normalize_binary_or_range(rq2f85_action, binary_threshold=70, scale=255)
 
-        if claw_state.size == 0 and qiangnao_state.size == 0:
+        if claw_state.size == 0 and qiangnao_state.size == 0 and sg100_state.size == 0:
             claw_state = rq2f85_state
             claw_action = rq2f85_action
 
@@ -222,11 +233,13 @@ def _load_bag_frames(
         if kuavo.CONTROL_HAND_SIDE in ("left", "both"):
             s, a = _hand_pair(
                 state=state,
-                action=action,
+                arm_action=arm_traj,
                 claw_state=claw_state,
                 claw_action=claw_action,
                 qiangnao_state=qiangnao_state,
                 qiangnao_action=qiangnao_action,
+                sg100_state=sg100_state,
+                sg100_action=sg100_action,
                 hand_side=0,
             )
             state_parts.append(s)
@@ -234,15 +247,33 @@ def _load_bag_frames(
         if kuavo.CONTROL_HAND_SIDE in ("right", "both"):
             s, a = _hand_pair(
                 state=state,
-                action=action,
+                arm_action=arm_traj,
                 claw_state=claw_state,
                 claw_action=claw_action,
                 qiangnao_state=qiangnao_state,
                 qiangnao_action=qiangnao_action,
+                sg100_state=sg100_state,
+                sg100_action=sg100_action,
                 hand_side=1,
             )
             state_parts.append(s)
             action_parts.append(a)
+
+        if kuavo.USE_5W_WHOLEBODY:
+            lower_start, lower_end = get_lower_body_joint_slice(kuavo.PLATFORM_TYPE)
+            lower_action = _array(aligned_frame, "action.lb_leg_traj")
+            lower_state = state[lower_start:lower_end]
+            lower_dof = lower_end - lower_start
+            if lower_state.size != lower_dof or lower_action.size != lower_dof:
+                return
+            state_parts.append(lower_state)
+            action_parts.append(lower_action)
+
+        if kuavo.USE_5W_BASE_MOVE:
+            base_velocity = _array(aligned_frame, "action.base_velocity")
+            if base_velocity.size != 3:
+                return
+            action_parts.append(base_velocity)
 
         frame = {
             "observation.state": torch.from_numpy(np.concatenate(state_parts).astype(np.float32)),
@@ -276,7 +307,12 @@ def _load_bag_frames(
     return frames
 
 
-def _frame_to_policy_observation(frame: dict[str, Any], device) -> dict[str, Any]:
+def _frame_to_policy_observation(
+    frame: dict[str, Any],
+    device,
+    *,
+    native_policy: bool,
+) -> dict[str, Any]:
     import torch
 
     obs: dict[str, Any] = {}
@@ -286,8 +322,24 @@ def _frame_to_policy_observation(frame: dict[str, Any], device) -> dict[str, Any
         if key == "observation.state":
             tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value, dtype=torch.float32)
             obs[key] = tensor.float().unsqueeze(0).to(device, non_blocking=True)
-        else:
+        elif not native_policy:
+            # Kuavo Server adapters own their model-specific image conversion and
+            # expect the transport representation (normally HWC uint8).
             obs[key] = value
+        else:
+            # Native LeRobot policies share the dataset image convention:
+            # BCHW float32 in [0, 1]. Policy-specific preprocessing is then
+            # handled by the processor pipeline stored with the checkpoint.
+            tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+            if tensor.ndim == 3 and tensor.shape[-1] in (1, 3, 4):
+                tensor = tensor.permute(2, 0, 1)
+            if tensor.dtype == torch.uint8:
+                tensor = tensor.float().div(255.0)
+            else:
+                tensor = tensor.float()
+            if tensor.ndim == 3:
+                tensor = tensor.unsqueeze(0)
+            obs[key] = tensor.contiguous().to(device, non_blocking=True)
     return obs
 
 
@@ -604,7 +656,7 @@ def _plot_actions(path: Path, predictions: np.ndarray, targets: np.ndarray, dims
 
     action_dim = predictions.shape[1]
     if dims is None:
-        dims = list(range(min(action_dim, 16)))
+        dims = list(range(action_dim))
     dims = [d for d in dims if 0 <= d < action_dim]
     if not dims:
         return
@@ -649,7 +701,11 @@ def _prepare_observation_for_policy(
 ) -> dict[str, Any]:
     from kuavo_deploy.utils.policy_loader import inject_task_prompt
 
-    observation = _frame_to_policy_observation(frame, device=device)
+    observation = _frame_to_policy_observation(
+        frame,
+        device=device,
+        native_policy=policy_type != "client",
+    )
     if policy_type != "client":
         observation = inject_task_prompt(observation, task_prompt)
     return observation

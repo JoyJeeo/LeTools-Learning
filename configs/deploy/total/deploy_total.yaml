@@ -1,11 +1,13 @@
 env:  # 推理环境设置。
   inference_env: real  # 选仿真还是真机。
-  only_arm: true  # 是否只控机械臂。
-  eef_type: leju_claw  # 夹爪或手型类型。
+  eef_type: leju_claw  # 夹爪或手型类型：leju_claw/qiangnao/sg100/rq2f85。
   platform_type: "4pro"  # 机器人型号。
+  5w_wholebody: false  # 仅 platform_type=5w 时生效。
+  5w_base_move: false  # 仅 platform_type=5w 时生效；从 action 末尾取 [vx, vy, vyaw] 发布 /cmd_vel。
+  5w_lowerlock: [0, 0, 0, 0]  # 全身模式下按 /lb_leg_traj index 锁定；1 使用 go_bag_path 首帧值，0 正常运动。推理和 bag 播放均生效。
   control_mode: joint  # 控制方式。
   which_arm: both  # 控制左手、右手还是双手。
-  head_init: [0, 12]  # 仿真中使用的头部初始角度 [yaw, pitch]。真机不会使用此角度。
+  head_init: [0, 0]  # 仿真中使用的头部初始角度 [yaw, pitch]。真机不会使用此角度。
 
   ros_rate: 10  # ROS 运行频率。
   direct_to_wbc: false  # 是否直接发给 WBC。
@@ -13,6 +15,7 @@ env:  # 推理环境设置。
   control_rate: 100  # WBC/插值后的实际控制指令频率
   image_size: [848, 480]  # 相机缩放尺寸。
   depth_range: [0, 1500]  # 深度裁剪范围。
+  camera_encoding: h265  # 相机编码格式: "jpeg" 或 "h265"。h265 时自动切换订阅 topic。
   obs_key_map:  # 各个观测 topic 的配置。
     head_cam_h: ["/cam_h/color/image_raw/compressed", "CompressedImage", 30, "${env.image_size}"]  # 头部相机 topic。
     wrist_cam_l: ["/cam_l/color/image_raw/compressed", "CompressedImage", 30, "${env.image_size}"]  # 左腕相机 topic。
@@ -21,24 +24,36 @@ env:  # 推理环境设置。
     rq2f85: ["/gripper/state", "JointState", 500]  # RQ2F85 topic。选这个夹爪时自动生效。
     leju_claw: ["/leju_claw_state", "lejuClawState", 500]  # Leju claw topic。选这个夹爪时自动生效。
     qiangnao: ["/dexhand/state", "JointState", 500]  # Qiangnao topic。选这个手型时自动生效。
+    sg100: ["/sg100_hand_state", "SG100HandState", 500]  # SG100 双手 22 维状态。
   arm_state_keys: ["joint_q", "gripper"]  # 哪些状态会拼成 observation.state。
   ratio: 1.0  # 动作缩放比例。
   frame_alignment: false  # 是否做时间对齐。
   qiangnao_dof_needed: 1  # Qiangnao 暴露多少个自由度。
+  sg100_dof_needed: 11  # 每手模型自由度：1（整手开合）或 11（逐关节）。
+  sg100_dof_offset: 0  # dof=1 时选择单手 11 维中的哪一维；dof=11 时必须为 0。
+  # 姿态使用弧度 [0, 1.57]，顺序均为左手 11 + 右手 11。
+  sg100_open_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.30938, 0.628, 0.46315, 1.57, 0.6594, 0.59346, 0.6594, 0.66254, 1.56058, 1.0205, 0.18369]
+  sg100_close_pose: [1.57, 1.57, 1.57, 1.57, 1.57, 1.57, 1.57, 1.57, 1.57, 1.57, 1.57, 1.30938, 0.88548, 0.54479, 1.57, 0.79285, 0.63742, 0.85722, 0.66568, 1.56058, 1.24501, 0.27946]
+  sg100_init_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.30938, 0.628, 0.46315, 1.57, 0.6594, 0.59346, 0.6594, 0.66254, 1.56058, 1.0205, 0.18369]
+  sg100_force_threshold: 0.5
+  sg100_force_kp: [0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1, 0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1]
+  sg100_force_kd: [0.002,0.002,0.002,0.002,0.002,0.002,0.002,0.002,0.002,0.002,0.002, 0.002,0.002,0.002,0.002,0.002,0.002,0.002,0.002,0.002,0.002,0.002]
+  sg100_force_torque_ff: [0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8, 0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8]
+  sg100_force_output_limit: [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5, 0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]
+  sg100_force_velocities: [0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0]
+  is_binary_sg100_action: false
+  sg100_action_threshold: 0.5
 
   limits:  # 动作和状态的上下限。
     joint_q:  # 关节上下限。
       min: [-3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14]  # 关节最小值。
       max: [3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14]  # 关节最大值。
     gripper:  # 夹爪上下限。
-      min: [0, 0]  # 夹爪最小值。
-      max: [1, 1]  # 夹爪最大值。
-    eef:  # 末端绝对位姿上下限。
-      min: [-1, -1, -1, -3.14, -3.14, -3.14, -1, -1, -1, -3.14, -3.14, -3.14]  # 末端绝对最小值。
-      max: [1, 1, 1, 3.14, 3.14, 3.14, 1, 1, 1, 3.14, 3.14, 3.14]  # 末端绝对最大值。
-    base:  # 底盘控制上下限。
-      min: [-2.0, -2.0, -3.14, 0]  # 底盘最小值。
-      max: [2.0, 2.0, 3.14, 1]  # 底盘最大值。
+      min: [-5, -5]  # 夹爪最小值。
+      max: [5, 5]  # 夹爪最大值。
+    lower_body:  # 5W下半身关节（模型与观测均使用弧度）。
+      min: [-3.14, -3.14, -3.14, -3.14]
+      max: [3.14, 3.14, 3.14, 3.14]
   is_binary: false  # 夹爪是否按开/关处理。
 
 inference:  # 推理和评测设置。

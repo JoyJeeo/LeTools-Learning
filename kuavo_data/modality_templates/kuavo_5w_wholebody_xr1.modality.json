@@ -1,0 +1,25 @@
+{
+  "model": {"state_dim": 60, "action_dim": 60},
+  "source": {"state": "observation.state", "action": "action"},
+  "action_representation": "delta",
+  "state": {
+    "left_arm": {"start": 0, "end": 7, "model_start": 0},
+    "left_gripper": {"start": 7, "end": 8, "model_start": 7},
+    "right_arm": {"start": 8, "end": 15, "model_start": 8},
+    "right_gripper": {"start": 15, "end": 16, "model_start": 15},
+    "lower_body": {"start": 16, "end": 20, "model_start": 16}
+  },
+  "action": {
+    "left_arm": {"start": 0, "end": 7, "model_start": 0, "state_component": "left_arm"},
+    "left_gripper": {"start": 7, "end": 8, "model_start": 7, "state_component": "left_gripper"},
+    "right_arm": {"start": 8, "end": 15, "model_start": 8, "state_component": "right_arm"},
+    "right_gripper": {"start": 15, "end": 16, "model_start": 15, "state_component": "right_gripper"},
+    "lower_body": {"start": 16, "end": 20, "model_start": 16, "state_component": "lower_body"}
+  },
+  "video": {
+    "head": {"original_key": "observation.images.head_cam_h"},
+    "wrist_left": {"original_key": "observation.images.wrist_cam_l"},
+    "wrist_right": {"original_key": "observation.images.wrist_cam_r"}
+  },
+  "annotation": {"human.task_description": {"original_key": "task_index"}}
+}

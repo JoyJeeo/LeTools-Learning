@@ -2,9 +2,15 @@
 #
 # 用法（任选其一）：
 #   python kuavo_server/launch.py openpi
+#   python kuavo_server/launch.py openpi_roban_wholebody
 #   python kuavo_server/launch.py groot
+#   python kuavo_server/launch.py groot_roban_wholebody
 #   python kuavo_server/launch.py lingbotvla
 #   python kuavo_server/launch.py lingbotvla2
+#   python kuavo_server/launch.py lingbotvla2_roban_wholebody
+#   python kuavo_server/launch.py xiaomi
+#   python kuavo_server/launch.py wallx
+#   python kuavo_server/launch.py g05
 #
 # 启动器会读取下面对应 adapter 的 env 段（决定怎么进入环境：uv / conda / 当前 shell）
 # 与 args 段（serve.py 的命令行参数），自动拼出原命令并 exec 运行。
@@ -26,6 +32,68 @@ common:
 adapters:
 
   # ============================================================
+  # Galaxea G0.5 (Kuavo fine-tuned checkpoint)
+  # ============================================================
+  g05:
+    env:
+      mode: uv
+      project: ${REPO_ROOT}/kuavo_model/external_models/GalaxeaVLA
+    args:
+      checkpoint: /path/to/kuavo_g05/checkpoints/model_state_dict.pt
+      model_repo_root: ${REPO_ROOT}/kuavo_model/external_models/GalaxeaVLA
+      execution_horizon: 16
+      device: cuda
+
+  # ============================================================
+  # Wall-X (native Wall-OSS-0.5 post-training/runtime)
+  # ============================================================
+  wallx:
+    adapter: wall_x
+    env:
+      mode: conda
+      conda_env: wallx
+    args:
+      checkpoint: /path/to/wallx_kuavo_merged_checkpoint        # 必填：合并后的 checkpoint 目录
+      train_config_path: ${REPO_ROOT}/kuavo_server/configs/wall_x/kuavo.yml
+      model_repo_root: ${REPO_ROOT}/kuavo_model/external_models/wall-x
+      which_arm: both                                           # left | right | both
+      action_horizon: 32                                        # 必须与训练配置一致
+      execution_horizon: 8                                      # 0 使用完整 chunk
+      device: cuda:0
+      num_inference_timesteps: 10
+      norm_key: kuavo
+
+  # ============================================================
+  # Xiaomi-Robotics-0 (official XR0 post-training checkpoint)
+  # ============================================================
+  xiaomi:
+    adapter: xiaomi_robotics_0
+    env:
+      mode: conda
+      conda_env: mibot
+    args:
+      checkpoint: /path/to/xr0/posttrain/checkpoint            # 含 config.py 与 last.ckpt/checkpoint
+      processor_path: /home/ruichen/Qwen3-VL-4B-Instruct       # Qwen3-VL processor 本地目录
+      execution_horizon: 10                                    # 0 返回完整 30-step chunk
+      device: cuda:0
+      model_repo_root: ""
+
+  # ============================================================
+  # Xiaomi-Robotics-1 (official XR1 post-training checkpoint)
+  # ============================================================
+  xiaomi1:
+    adapter: xiaomi_robotics_1
+    env:
+      mode: conda
+      conda_env: mibot_xr1
+    args:
+      checkpoint: /path/to/xr1/posttrain/checkpoint            # 实验目录或具体的 *.ckpt 目录
+      processor_path: /home/ruichen/Qwen3-VL-4B-Instruct       # Qwen3-VL 本地目录或 Hugging Face ID
+      execution_horizon: 10                                    # 0 返回完整 30-step chunk
+      device: cuda:0
+      model_repo_root: ""                                      # 留空 -> external_models/Xiaomi-Robotics-1
+
+  # ============================================================
   # OpenPI
   # ============================================================
   openpi:
@@ -34,12 +102,31 @@ adapters:
       project: ${REPO_ROOT}/kuavo_model/external_models/openpi
     args:
       checkpoint: /path/to/openpi/checkpoint                  # 必填：openpi checkpoint 目录
-      policy_config_name: pi0_kuavo                           # openpi 训练 config 名
+      policy_config_name: pi0_kuavo                           # 5W 全身 checkpoint 改为 pi0_kuavo_5w_wholebody
       which_arm: both                                         # left | right | both（adapter 默认 right）
+      eef_dof: 1                                              # qiangnao/leju_claw=1；SG100=11
       model_repo_root: ""                                     # 留空 -> external_models/openpi
       execution_horizon: 0                                    # 0 -> 用 config.model.action_horizon
       device: ""                                              # "" | cuda | cuda:0 | cpu
       asset_id: ""                                            # "" -> auto-detect from checkpoint/assets/*
+      arm_joint_dim: 7                                        # 手臂自由度，不与 16/20 总维度绑定
+      end_effector_dim: null                                  # 留空跟随 eef_dof；也可显式指定单侧末端自由度
+
+  # ============================================================
+  # OpenPI - Roban wholebody 23D state / 32D action
+  # ============================================================
+  openpi_roban_wholebody:
+    adapter: openpi_roban_wholebody
+    env:
+      mode: uv
+      project: ${REPO_ROOT}/kuavo_model/external_models/openpi
+    args:
+      checkpoint: /path/to/openpi/roban_wholebody/checkpoint
+      policy_config_name: pi0_roban_wholebody
+      model_repo_root: ""
+      execution_horizon: 0                                   # 0 -> 完整使用模型默认的 50-step chunk
+      device: ""
+      asset_id: ""                                           # 自动检测 roban_wholebody
 
   # ============================================================
   # Isaac GR00T N1.7 
@@ -53,15 +140,32 @@ adapters:
       checkpoint: /path/to/gr00t/checkpoint                   # 必填
       embodiment_tag: NEW_EMBODIMENT                          # 或 new_embodiment
       which_arm: both
+      eef_dof: 1                                              # qiangnao/leju_claw=1；SG100=11
       execution_horizon: 16                                   # receding horizon chunk size
       device: cuda
       strict: false                                           # true 时开启严格 IO 检查
       model_repo_root: ""                                     # 留空 -> external_models/gr00tn1d7
 
   # ============================================================
+  # Isaac GR00T N1.7 - Roban wholebody 23D state / 32D action
+  # ============================================================
+  groot_roban_wholebody:
+    adapter: isaac_gr00t_n17_roban_wholebody
+    env:
+      mode: uv
+      project: ${REPO_ROOT}/kuavo_model/external_models/gr00tn1d7
+    args:
+      checkpoint: /path/to/gr00t/checkpoint
+      embodiment_tag: NEW_EMBODIMENT
+      execution_horizon: 40
+      device: cuda
+      strict: false
+      model_repo_root: ""
+
+  # ============================================================
   # LingBot-VLA 
   # ============================================================
-  lingbotvla:
+  lingbotvla: # kuavo_server/configs/lingbotvla/kuavo.yaml得跟训练一致
     adapter: lingbot_vla
     env:
       mode: conda
@@ -73,6 +177,7 @@ adapters:
       robot_norm_path: /path/to/robot_norm.json               # 必填：Kuavo norm stats JSON
       robot_config_path: ""                                   # 留空 -> kuavo_server/configs/lingbotvla/kuavo.yaml
       which_arm: both
+      eef_dof: 1                                              # qiangnao/leju_claw=1；SG100=11
       execution_horizon: 25                                   # -1 返回模型完整 chunk
       num_denoising_step: 10
       use_compile: false                                      # torch.compile
@@ -82,7 +187,7 @@ adapters:
   # ============================================================
   # LingBot-VLA v2
   # ============================================================
-  lingbotvla2:
+  lingbotvla2: # kuavo_server/configs/lingbotvla_v2/kuavo.yaml得跟训练一致
     adapter: lingbot_vla_v2
     env:
       mode: conda
@@ -94,7 +199,27 @@ adapters:
       robot_norm_path: /path/to/kuavo_norm.json               # 必填：Kuavo norm stats JSON
       robot_config_path: ""                                   # 留空 -> kuavo_server/configs/lingbotvla_v2/kuavo.yaml
       which_arm: both
+      eef_dof: 1                                              # qiangnao/leju_claw=1；SG100=11
       execution_horizon: 25                                   # -1 返回模型完整 chunk
       use_compile: false                                      # torch.compile
       use_fp32: false                                         # true 时用 fp32（默认 bf16）
+      model_repo_root: ""                                     # 留空 -> external_models/lingbot-vla-v2
+
+  # ============================================================
+  # LingBot-VLA v2 - Roban wholebody 23D state / 32D action
+  # ============================================================
+  lingbotvla2_roban_wholebody:
+    adapter: lingbot_vla_v2_roban_wholebody
+    env:
+      mode: conda
+      conda_env: lingbotvla2
+    args:
+      checkpoint: /path/to/lingbot-vla-v2/hf_ckpt/model
+      training_config_path: ""                                # 留空 -> configs/vla/roban_wholebody/roban_wholebody.yaml
+      qwen3vl_path: /path/to/Qwen3-VL-4B-Instruct
+      robot_norm_path: /path/to/roban_norm.json               # 必填：compute_norm_stats 生成的 JSON
+      robot_config_path: ""                                   # 这里请检查是否使用的是relative训练，留空 -> kuavo_server/configs/lingbotvla_v2/roban_wholebody.yaml
+      execution_horizon: 50                                   # -1 返回模型完整 chunk；50 对齐 50Hz wholebody
+      use_compile: false
+      use_fp32: false
       model_repo_root: ""                                     # 留空 -> external_models/lingbot-vla-v2

@@ -1,0 +1,58 @@
+# Roban wholebody inference: ROS1 camera + native DDS state/HEFT commands.
+platform_type: roban
+
+camera:
+  topic: /camera/color/image_raw/compressed
+  width: 640
+  height: 480
+  max_age: 0.5
+  startup_timeout: 10.0
+
+dds:
+  domain_id: 0
+  state_max_age: 0.2
+  # Bind DDS to the robot Ethernet instead of the edge computer's Wi-Fi.
+  config_uri: cyclonedds_roban_edge.xml
+
+inference:
+  # client connects to kuavo_server; any other value loads a local LeRobot model.
+  policy_type: client
+  pretrained_path: ""
+  device: cuda
+  task_prompt: "robot manipulation"
+  server_host: localhost
+  server_port: 5555
+  api_token: ""
+  max_steps: 100000
+
+execution:
+  # async keeps HEFT's 50 Hz stream alive while the next chunk is inferred.
+  # sync is retained for debugging and can miss deadlines during model inference.
+  mode: sync
+  action_hz: 50.0
+  prefetch_steps: 4
+  buffer_capacity: 200
+  startup_timeout: 30.0
+  action_timeout: 0.2
+  # A short underrun holds the last action; a persistent underrun stops output
+  # so HEFT's watchdog/controller fallback can take over.
+  max_hold_steps: 5
+  blend_enabled: false
+  blend_overlap_steps: 4
+  blend_ramp: cosine
+  max_inference_delay_steps: 50
+
+heft:
+  # Model grippers are [0,1]; DDS /rt/hand_cmd is [0,100] left6+right6.
+  hand_scale: 100.0
+  # Stream references before switching so the lower-computer live buffer is warm.
+  warmup_sec: 0.4
+  # Optional existing controller SDK CLI. Empty means controller switching is external.
+  switch_cli: "/your_path_to/lejulab_platform/devel/lib/leju-rl-controller/controller_switch_cli"
+  switch_library_path: "/your_path_to/lejulab_platform/src/lejusdk/3rd_party/x86_64/cyclonedds-cxx-0.10.2/lib:/your_path_to/lejulab_platform/src/lejusdk/3rd_party/x86_64/cyclonedds-0.10.2/lib"
+  # Optional HEFT q21 output smoothing. Disabled preserves the original stream.
+  joint_filter_enabled: true
+  joint_filter_cutoff_hz: 10.0
+  joint_filter_deadband: 0.0
+  controller: heft_pico
+  fallback_controller: amp

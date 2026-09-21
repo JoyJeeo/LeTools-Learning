@@ -1,0 +1,13 @@
+# @package _global_
+
+model:
+  type: "BaseRunner"
+  params:
+    pretrained: ???
+    model:
+      type: "xr1"
+      vlm_path: "Qwen/Qwen3-VL-4B-Instruct"
+      freq_coefficient: 1.0
+      freq_excluded_dims: [17, 18, 19]
+      ffn_gradient_checkpointing: true
+      async_train: false

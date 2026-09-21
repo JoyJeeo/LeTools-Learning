@@ -3,7 +3,7 @@
 # 设置遇到错误立即停止执行
 set -e
 echo "==================================================="
-echo "🚀 欢迎使用 KDC 项目环境配置脚本! 先进行pip换源"
+echo "🚀 欢迎使用 Letools-Learning 项目环境配置脚本! 先进行pip换源"
 echo "==================================================="
 pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple  # 建议首先换源，能加快下载安装速度
 

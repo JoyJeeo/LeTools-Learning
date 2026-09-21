@@ -1,0 +1,95 @@
+# Wall-X native post-training config for kuavo_data LeRobot v3 output.
+# Replace every /path/to/... value before training.
+model_type: qwen2_5
+
+task:
+  # kuavo_data both-arm order:
+  # left arm joints[7], left gripper[1], right arm joints[7], right gripper[1].
+  dof_config:
+    master_left_arm_joint_pos: 7
+    master_left_gripper: 1
+    master_right_arm_joint_pos: 7
+    master_right_gripper: 1
+    action_padding: 10
+  agent_pos_config:
+    follow_left_arm_joint_pos: 7
+    follow_left_gripper: 1
+    follow_right_arm_joint_pos: 7
+    follow_right_gripper: 1
+    action_padding: 10
+  action_horizon: 32
+  action_horizon_flow: 32
+  use_state_string_representation: false
+
+model:
+  backbone: qwen2_5
+  config_path: /path/to/wall-oss-0.5/config.json
+  processor_path: /path/to/Qwen2.5-VL-3B-Instruct
+  pretrained_path: /path/to/Qwen2.5-VL-3B-Instruct
+  attn_deterministic: true
+  use_ema: false
+  flow_loss_weight: 1.0
+  ar_loss_weight: 0.01
+
+hyperparams:
+  num_epoch: 100
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 4
+  seed: 10233
+  optimizer:
+    optimizer_type: adamw
+    learning_rate: 5.0e-05
+    max_grad_norm: 1.0
+    enable_grad_clip: true
+    betas: [0.9, 0.95]
+    weight_decay: 1.0e-8
+    eps: 1.0e-8
+  scheduler:
+    scheduler_type: cosine
+    num_warmup_steps: 1000
+    num_training_steps: 60000
+    min_lr: 1.0e-6
+
+distributed:
+  use_fsdp: true
+  use_mixed_precision: true
+  bf16: true
+
+data:
+  dataset_type: lerobot
+  lerobot_config:
+    repo_id: kuavo
+    root: /path/to/kuavo_lerobot_v3
+  key_mappings:
+    camera:
+      observation.images.head_cam_h: face_view
+      observation.images.wrist_cam_l: left_wrist_view
+      observation.images.wrist_cam_r: right_wrist_view
+    state: observation.state
+    action: action
+  norm_stats_path: /path/to/kuavo_lerobot_v3_norm_stats.json
+  train_test_split: 0.95
+  num_workers: 4
+  max_length: 1024
+  resolution:
+    face_view: 448
+    left_wrist_view: 448
+    right_wrist_view: 448
+
+logging:
+  log_name: wallx_kuavo
+  log_project: wallx_kuavo
+  log_entity: null
+  use_wandb: false
+  log_interval: 10
+  save_interval: 1000
+  val_interval: 1000
+  epoch_save_interval: 1
+
+checkpoint:
+  save_path: /path/to/wallx_kuavo_output
+  resume_from: /path/to/wall-oss-0.5/model.safetensors
+
+debug:
+  profile: false
+  nvtx: false

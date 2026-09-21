@@ -45,10 +45,14 @@ def kuavo_repo_root() -> Path:
 
 
 DEFAULT_MODEL_REPOS: dict[str, Path] = {
+    "g05": kuavo_repo_root() / "kuavo_model" / "external_models" / "GalaxeaVLA",
     "openpi": kuavo_repo_root() / "kuavo_model" / "external_models" / "openpi",
+    "wall_x": kuavo_repo_root() / "kuavo_model" / "external_models" / "wall-x",
     "isaac_gr00t_n17": kuavo_repo_root() / "kuavo_model" / "external_models" / "gr00tn1d7",
     "lingbot_vla": kuavo_repo_root() / "kuavo_model" / "external_models" / "lingbot-vla",
     "lingbot_vla_v2": kuavo_repo_root() / "kuavo_model" / "external_models" / "lingbot-vla-v2",
+    "xiaomi_robotics_0": kuavo_repo_root() / "kuavo_model" / "external_models" / "Xiaomi-Robotics-0",
+    "xiaomi_robotics_1": kuavo_repo_root() / "kuavo_model" / "external_models" / "Xiaomi-Robotics-1",
 }
 
 
@@ -69,7 +73,7 @@ def resolve_model_repo_root(adapter_name: str, model_repo_root: str | None = Non
             raise FileNotFoundError(f"repo not found at: {repo_path}")
         raise FileNotFoundError(
             f"Default repo for adapter `{adapter_name}` not found at: {repo_path}. "
-            "Please vendor the model repo into `kuavo_model/external_models` or pass `--model_repo_root`."
+            "Please vendor the model repo at its configured default path or pass `--model_repo_root`."
         )
 
     return repo_path

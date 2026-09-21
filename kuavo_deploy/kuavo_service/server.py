@@ -163,7 +163,6 @@ class Policy():
         config_path = 'configs/deploy/deploy.yaml'
         cfg = load_inference_config(config_path)
 
-        use_delta = cfg.use_delta
         eval_episodes = cfg.eval_episodes
         seed = cfg.seed
         start_seed = cfg.start_seed

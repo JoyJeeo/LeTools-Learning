@@ -17,6 +17,11 @@ so you can override any single value without editing the YAML, e.g.:
     python kuavo_server/launch.py openpi --checkpoint /tmp/ckpt --port 6000
     python kuavo_server/launch.py groot --execution_horizon 8
     python kuavo_server/launch.py lingbotvla2 --checkpoint /tmp/v2/hf_ckpt/model
+    python kuavo_server/launch.py lingbotvla2_roban_wholebody --checkpoint /tmp/v2/hf_ckpt/model
+    python kuavo_server/launch.py xiaomi --checkpoint /tmp/xr0/checkpoint
+    python kuavo_server/launch.py xiaomi1 --checkpoint /tmp/xr1/checkpoint
+    python kuavo_server/launch.py wallx --checkpoint /tmp/wallx/checkpoint
+    python kuavo_server/launch.py g05 --checkpoint /tmp/g05/model_state_dict.pt
 """
 
 from __future__ import annotations
@@ -121,7 +126,11 @@ def main() -> None:
             "Example: launch.py openpi --port 6000 --checkpoint /tmp/ckpt"
         ),
     )
-    ap.add_argument("adapter", nargs="?", help="adapter name (openpi / isaac_gr00t_n17 / lingbot_vla / lingbotvla2 / ...)")
+    ap.add_argument(
+        "adapter",
+        nargs="?",
+        help="adapter name (g05 / openpi / wallx / groot / lingbotvla / lingbotvla2 / xiaomi / ...)",
+    )
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help=f"YAML config (default: {DEFAULT_CONFIG})")
     ap.add_argument("--list", action="store_true", help="list adapters defined in the config and exit")
     ap.add_argument("--dry-run", action="store_true", help="print the resolved command without executing")

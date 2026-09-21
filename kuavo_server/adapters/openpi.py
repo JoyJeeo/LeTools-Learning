@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 import dataclasses
 import json
@@ -71,6 +70,7 @@ class _OpenPiRuntime:
         execution_horizon: int,
         pytorch_device: str,
         asset_id: str,
+        repack_structure: dict[str, Any] | None = None,
     ) -> None:
         print(f"[openpi] repo_root={repo_root}", flush=True)
         print(f"[openpi] checkpoint_dir={checkpoint_dir}", flush=True)
@@ -102,7 +102,8 @@ class _OpenPiRuntime:
         repack_transforms = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
-                    {
+                    repack_structure
+                    or {
                         "cam_h": "observation.images.head_cam_h",
                         "cam_r": "observation.images.wrist_cam_r",
                         "cam_l": "observation.images.wrist_cam_l",
@@ -168,9 +169,12 @@ class OpenPiJaxLejuAdapter(ModelServerAdapter):
         model_repo_root: str,
         policy_config_name: str,
         which_arm: str,
+        eef_dof: int,
         execution_horizon: int,
         device: str,
         asset_id: str,
+        arm_joint_dim: int = 7,
+        end_effector_dim: int | None = None,
     ) -> None:
         self.model_repo_root = _resolve_repo_root(model_repo_root)
         self.checkpoint = Path(checkpoint).expanduser().resolve()
@@ -179,7 +183,12 @@ class OpenPiJaxLejuAdapter(ModelServerAdapter):
 
         self.policy_config_name = policy_config_name
         self.which_arm = which_arm
+        self.eef_dof = eef_dof
         self.device = device
+        self.arm_joint_dim = arm_joint_dim
+        self.end_effector_dim = eef_dof if end_effector_dim is None else end_effector_dim
+        if self.arm_joint_dim <= 0 or self.end_effector_dim < 0:
+            raise ValueError("arm_joint_dim must be positive and end_effector_dim must be non-negative")
         self.asset_id = asset_id or self._detect_asset_id(self.checkpoint)
         self.expected_state_dim = self._detect_norm_dim(self.checkpoint, self.asset_id, "state")
         self.expected_action_dim = self._detect_norm_dim(self.checkpoint, self.asset_id, "actions")
@@ -199,6 +208,17 @@ class OpenPiJaxLejuAdapter(ModelServerAdapter):
             pytorch_device=device,
             asset_id=self.asset_id,
         )
+        self.configured_action_dim = getattr(self.model.config.data, "physical_action_dim", None)
+        if (
+            self.expected_action_dim is not None
+            and self.configured_action_dim is not None
+            and self.expected_action_dim != self.configured_action_dim
+        ):
+            raise ValueError(
+                f"OpenPI config {self.policy_config_name!r} emits {self.configured_action_dim} physical action dims, "
+                f"but checkpoint norm stats contain {self.expected_action_dim}. For a 5W whole-body checkpoint, "
+                "use policy_config_name=pi0_kuavo_5w_wholebody."
+            )
         print("[openpi] adapter initialization finished", flush=True)
 
     @staticmethod
@@ -243,6 +263,7 @@ class OpenPiJaxLejuAdapter(ModelServerAdapter):
             help="openpi training config name used to construct the policy",
         )
         parser.add_argument("--which_arm", type=str, default="right", choices=["left", "right", "both"])
+        parser.add_argument("--eef_dof", type=int, default=1, choices=[1, 11])
         parser.add_argument(
             "--execution_horizon",
             type=int,
@@ -261,6 +282,9 @@ class OpenPiJaxLejuAdapter(ModelServerAdapter):
             default="",
             help="Optional checkpoint asset id used to load norm stats. Default is auto-detect from checkpoint/assets/*.",
         )
+        parser.add_argument("--arm_joint_dim", type=int, default=7)
+        parser.add_argument("--end_effector_dim", type=int, default=None)
+
     @classmethod
     def from_args(cls, args: Namespace) -> "OpenPiJaxLejuAdapter":
         return cls(
@@ -268,9 +292,12 @@ class OpenPiJaxLejuAdapter(ModelServerAdapter):
             model_repo_root=args.model_repo_root,
             policy_config_name=args.policy_config_name,
             which_arm=args.which_arm,
+            eef_dof=args.eef_dof,
             execution_horizon=args.execution_horizon,
             device=args.device,
             asset_id=args.asset_id,
+            arm_joint_dim=args.arm_joint_dim,
+            end_effector_dim=args.end_effector_dim,
         )
 
     def metadata(self) -> dict[str, Any]:
@@ -281,8 +308,14 @@ class OpenPiJaxLejuAdapter(ModelServerAdapter):
             "checkpoint": str(self.checkpoint),
             "policy_config_name": self.policy_config_name,
             "which_arm": self.which_arm,
+            "eef_dof": self.eef_dof,
             "execution_horizon": self.model.execution_horizon,
             "asset_id": self.asset_id,
+            "state_dim": self.expected_state_dim,
+            "action_dim": self.expected_action_dim,
+            "configured_action_dim": self.configured_action_dim,
+            "arm_joint_dim": self.arm_joint_dim,
+            "end_effector_dim": self.end_effector_dim,
         }
 
     def reset(self) -> dict[str, Any]:
@@ -314,32 +347,48 @@ class OpenPiJaxLejuAdapter(ModelServerAdapter):
         if expected is None or state.shape[0] == expected:
             return state
 
-        if state.shape[0] == 16 and expected == 8:
+        per_arm_dim = self.arm_joint_dim + self.end_effector_dim
+        full_arm_dim = 2 * per_arm_dim
+        lower_body_dim = state.shape[0] - full_arm_dim
+        expected_lower_body_dim = expected - per_arm_dim
+        if (
+            self.which_arm in ("left", "right")
+            and lower_body_dim >= 0
+            and expected_lower_body_dim == lower_body_dim
+        ):
             if self.which_arm == "left":
-                return state[:8]
+                arm_state = state[:per_arm_dim]
             if self.which_arm == "right":
-                return state[8:16]
-
-        if state.shape[0] > expected:
-            return state[:expected]
+                arm_state = state[per_arm_dim:full_arm_dim]
+            return np.concatenate([arm_state, state[full_arm_dim:]], axis=0)
 
         raise ValueError(
             f"Unsupported state shape {state.shape} for expected_state_dim={expected} "
-            f"under which_arm={self.which_arm}"
+            f"under which_arm={self.which_arm}. Check that deploy 5w_wholebody and the "
+            "OpenPI checkpoint/config use the same physical state layout."
         )
 
     def _convert_action(self, action: Any) -> np.ndarray:
         action_np = _to_numpy(action).reshape(-1).astype(np.float64)
 
-        if action_np.shape[0] == 16:
-            if self.which_arm == "both":
-                return action_np
-            if self.which_arm == "left":
-                return np.concatenate([action_np[:7], action_np[7:8]], axis=0)
-            if self.which_arm == "right":
-                return np.concatenate([action_np[8:15], action_np[15:16]], axis=0)
+        if self.expected_action_dim is not None and action_np.shape[0] != self.expected_action_dim:
+            raise ValueError(
+                f"OpenPI returned {action_np.shape[0]} action dims, but checkpoint norm stats expect "
+                f"{self.expected_action_dim}. Use policy_config_name=pi0_kuavo_5w_wholebody for a "
+                "20D 5W whole-body checkpoint."
+            )
 
-        if action_np.shape[0] == 8 and self.which_arm in ("left", "right"):
+        if self.which_arm == "both":
+            return action_np
+
+        per_arm_dim = self.arm_joint_dim + self.end_effector_dim
+        full_arm_dim = 2 * per_arm_dim
+        if action_np.shape[0] >= full_arm_dim:
+            arm_offset = 0 if self.which_arm == "left" else per_arm_dim
+            arm_action = action_np[arm_offset : arm_offset + per_arm_dim]
+            return np.concatenate([arm_action, action_np[full_arm_dim:]], axis=0)
+
+        if action_np.shape[0] >= per_arm_dim:
             return action_np
 
         raise ValueError(

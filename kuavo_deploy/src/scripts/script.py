@@ -130,9 +130,12 @@ class ArmMove:
         self.inference_config = config.inference
         self.bag_path = self.inference_config.go_bag_path
 
+        initial_topics = ["/control_robot_hand_position", "/leju_claw_command", "/kuavo_arm_traj", "/sg100_hand_command"]
+        if config.env.use_5w_wholebody:
+            initial_topics.append("/lb_leg_traj")
         self.msg_dict_of_list = self._read_topic_messages(
-            bag_path = self.bag_path,
-            topic_names = ["/control_robot_hand_position","/leju_claw_command","/kuavo_arm_traj"]
+            bag_path=self.bag_path,
+            topic_names=initial_topics,
         )
 
         rospy.init_node('kuavo_deploy', anonymous=True)
@@ -191,9 +194,11 @@ class ArmMove:
         if self.env.which_arm=="both":
             target_positions = position
         elif self.env.which_arm=="left":
-            target_positions = np.concatenate([position[:7],self.env.arm_init[7:]],axis=0)
+            half = self.env.arm_dof_per_side
+            target_positions = np.concatenate([position[:half], self.env.arm_init[half:]], axis=0)
         elif self.env.which_arm=="right":
-            target_positions = np.concatenate([self.env.arm_init[:7],position[7:]],axis=0)
+            half = self.env.arm_dof_per_side
+            target_positions = np.concatenate([self.env.arm_init[:half], position[half:]], axis=0)
         else:
             raise ValueError(f"Invalid which_arm: {self.env.which_arm}, must be 'left', 'right', or 'both'")
         self.env.robot.control_arm_joint_positions(target_positions)
@@ -227,6 +232,48 @@ class ArmMove:
     def _pub_rq2f85(self,msg) -> None:
         self.env.pub_eef_joint.publish(msg)
 
+    def _pub_lower_body(self, msg) -> None:
+        """Replay a lower-body target using the bag's degree convention."""
+        if isinstance(msg, list):
+            target_position = np.asarray(msg, dtype=float)
+        else:
+            target_position = np.deg2rad(np.asarray(msg.position, dtype=float))
+
+        expected_dof = len(self.env.limits["lower_body"]["min"])
+        if target_position.size != expected_dof:
+            raise ValueError(
+                f"Expected {expected_dof} lower-body joint positions from /lb_leg_traj, "
+                f"got {target_position.size}"
+            )
+        self.env.safe_control_lower_body(target_position)
+
+    def _publish_bag_message(self, topic: str, msg) -> None:
+        if topic == "/kuavo_arm_traj":
+            self._pub_arm_traj(msg)
+        elif topic == "/leju_claw_command":
+            self._pub_leju_claw(msg)
+        elif topic == "/control_robot_hand_position":
+            self._pub_qiangnao(msg)
+        elif topic == "/gripper_command":
+            self._pub_rq2f85(msg)
+        elif topic == "/sg100_hand_command":
+            self._pub_sg100(msg)
+        elif topic == "/lb_leg_traj":
+            self._pub_lower_body(msg)
+
+    def _pub_sg100(self, msg) -> None:
+        positions = list(msg.left_hand_positions) + list(msg.right_hand_positions)
+        self.env.sg100.control(
+            target_positions=positions,
+            kp=self.env.sg100_force_kp.tolist(),
+            kd=self.env.sg100_force_kd.tolist(),
+            torque_ff=self.env.sg100_force_torque_ff.tolist(),
+            output_limit=self.env.sg100_force_output_limit.tolist(),
+            target_velocities=self.env.sg100_force_velocities.tolist(),
+            enable_left=self.env.which_arm in ('left', 'both'),
+            enable_right=self.env.which_arm in ('right', 'both'),
+        )
+
     def play_bag(self, go_bag, reverse=False):
         """
         将机械臂移动到工作姿态。均匀发布机械臂、手部位置和夹爪命令。
@@ -242,13 +289,21 @@ class ArmMove:
             topics = ["/kuavo_arm_traj", "/control_robot_hand_position"]
         elif self.env.eef_type == 'rq2f85':
             topics = ["/kuavo_arm_traj", "/gripper_command"]
+        elif self.env.eef_type == 'sg100':
+            topics = ["/kuavo_arm_traj", "/sg100_hand_command"]
         else:
-            raise ValueError(f"Invalid eef_type: {self.env.eef_type}, must be 'leju_claw' or 'qiangnao' or 'rq2f85' ")
+            raise ValueError(f"Invalid eef_type: {self.env.eef_type}, must be 'leju_claw', 'qiangnao', 'sg100', or 'rq2f85' ")
+        if self.env.use_5w_wholebody:
+            topics.append("/lb_leg_traj")
         
         msg_dict_of_list = self._read_topic_messages(
             bag_path = go_bag, 
             topic_names = topics
         )
+        if self.env.use_5w_wholebody and not msg_dict_of_list.get("/lb_leg_traj"):
+            raise ValueError(
+                "5w_wholebody is enabled, but the bag contains no /lb_leg_traj messages"
+            )
         if reverse:
             msg_dict_of_list = {topic: msg_dict_of_list[topic][::-1] for topic in msg_dict_of_list}
         log_robot.info(f"将回放 {go_bag} 中的 {[topic for topic in msg_dict_of_list.keys()]} 主题的消息")
@@ -265,6 +320,11 @@ class ArmMove:
         if not msg_lists:
             log_robot.warning("没有找到任何有效的消息数据可以播放")
             return
+
+        if self.env.use_5w_wholebody:
+            lower_info = msg_lists["/lb_leg_traj"]
+            self._pub_lower_body(lower_info["msgs"][0])
+            log_robot.info("发布 /lb_leg_traj 首帧")
         
         # 计算总步数为最长的消息列表的长度
         max_steps = max(info["total"] for info in msg_lists.values())
@@ -285,14 +345,7 @@ class ArmMove:
                 
                 # 只有当索引变化时才发布新消息
                 if target_index > info["index"]:
-                    if topic=="/kuavo_arm_traj":
-                        self._pub_arm_traj(info["msgs"][target_index])
-                    elif topic=="/leju_claw_command":
-                        self._pub_leju_claw(info["msgs"][target_index])
-                    elif topic=="/control_robot_hand_position":
-                        self._pub_qiangnao(info["msgs"][target_index])
-                    elif topic=="/gripper_command":
-                        self._pub_rq2f85(info["msgs"][target_index])
+                    self._publish_bag_message(topic, info["msgs"][target_index])
                 log_robot.info(f"发布 {topic} 消息 {target_index+1}/{info['total']}")
             # 控制发布频率
             rate.sleep()
@@ -301,14 +354,7 @@ class ArmMove:
         for topic, info in msg_lists.items():
             if info["index"] < info["total"] - 1:
                 target_index = info["total"] - 1
-                if topic=="/kuavo_arm_traj":
-                    self._pub_arm_traj(info["msgs"][target_index])
-                elif topic=="/leju_claw_command":
-                    self._pub_leju_claw(info["msgs"][target_index])
-                elif topic=="/control_robot_hand_position":
-                    self._pub_qiangnao(info["msgs"][target_index])
-                elif topic=="/gripper_command":
-                    self._pub_rq2f85(info["msgs"][target_index])
+                self._publish_bag_message(topic, info["msgs"][target_index])
                 log_robot.info(f"发布 {topic} 最终消息")
         
         log_robot.info("消息序列播放完成")
@@ -406,15 +452,19 @@ class ArmMove:
 
     def run(self) -> None:
         """执行运行"""
-        if self.config.inference.async_inference:
-            from kuavo_deploy.src.eval.real_async_test import kuavo_eval_async
+        # 这里为了安全考虑，加一个stop base的函数
+        try:
+            if self.config.inference.async_inference:
+                from kuavo_deploy.src.eval.real_async_test import kuavo_eval_async
 
-            kuavo_eval_async(config=self.config, env=self.env)
-            return
+                kuavo_eval_async(config=self.config, env=self.env)
+                return
 
-        from kuavo_deploy.src.eval.real_single_test import kuavo_eval
+            from kuavo_deploy.src.eval.real_single_test import kuavo_eval
 
-        kuavo_eval(config=self.config, env=self.env)
+            kuavo_eval(config=self.config, env=self.env)
+        finally:
+            self.env.stop_base()
 
 def parse_args():
     """解析命令行参数"""

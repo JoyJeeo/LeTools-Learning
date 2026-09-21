@@ -3,6 +3,7 @@ import rospy
 import numpy as np
 from cv_bridge import CvBridge
 from sensor_msgs.msg import CompressedImage, JointState
+from geometry_msgs.msg import Twist
 import cv2
 import gymnasium as gym
 import time
@@ -19,15 +20,18 @@ from torchvision.transforms.functional import to_tensor
 from kuavo_deploy.utils.obs_buffer import ObsBuffer
 from kuavo_deploy.utils.signal_controller import ControlSignalManager
 from kuavo_deploy.utils.lowpass_filter import LowPassFilter
+from kuavo_deploy.utils.sg100_msgs import SG100HandCommand
 from std_srvs.srv import SetBool
 
 log_robot = setup_logger("robot")
+BASE_VELOCITY_DOF = 3
 
 
 class KuavoBaseRosEnv(gym.Env):
     """Kuavo机器人ROS环境基类"""
 
     def __init__(self, config: KuavoConfig):
+        self._init_lower_body_lock(config)
         self._set_config(config.env)
         
         # 初始化ROS管理器
@@ -45,17 +49,61 @@ class KuavoBaseRosEnv(gym.Env):
         log_robot.info(f"Inializing done!")
         print(f"Inializing done!")
 
+    def _init_lower_body_lock(self, config: KuavoConfig):
+        """Cache the configured go bag's first lower-body target in radians."""
+        self.lower_body_lock_mask = np.asarray(config.env.lowerlock_5w, dtype=bool)
+        self.lower_body_lock_target = None
+        if not config.env.use_5w_wholebody or not self.lower_body_lock_mask.any():
+            return
+        bag_path = config.inference.go_bag_path
+        if not bag_path:
+            raise ValueError("env.5w_lowerlock requires inference.go_bag_path")
+
+        import rosbag
+
+        with rosbag.Bag(bag_path, "r") as bag:
+            for _, msg, _ in bag.read_messages(topics=["/lb_leg_traj"]):
+                positions = np.asarray(msg.position, dtype=float)
+                if positions.shape != (4,) or not np.isfinite(positions).all():
+                    raise ValueError(
+                        "env.5w_lowerlock requires four finite positions in the "
+                        "first /lb_leg_traj frame of inference.go_bag_path"
+                    )
+                self.lower_body_lock_target = np.deg2rad(positions)
+                break
+        if self.lower_body_lock_target is None:
+            raise ValueError(
+                "env.5w_lowerlock requires /lb_leg_traj in inference.go_bag_path"
+            )
+
     def _set_config(self, config_kuavo_env):
         """设置配置参数"""
         self.platform_type = config_kuavo_env.platform_type
+        self.use_5w_wholebody = config_kuavo_env.use_5w_wholebody
+        self.use_5w_base_move = config_kuavo_env.use_5w_base_move
+        self.arm_dof_per_side = config_kuavo_env.arm_dof_per_side
+        self.arm_dof = self.arm_dof_per_side * 2
+        self.eef_dof_per_side = config_kuavo_env.eef_dof_per_side
         self.ros_rate = config_kuavo_env.ros_rate
         self.control_mode = config_kuavo_env.control_mode
         self.obs_key_map = config_kuavo_env.obs_key_map
-        self.only_arm = config_kuavo_env.only_arm
         self.eef_type = config_kuavo_env.eef_type
         self.which_arm = config_kuavo_env.which_arm
         self.direct_to_wbc = config_kuavo_env.direct_to_wbc
         self.qiangnao_dof_needed = config_kuavo_env.qiangnao_dof_needed
+        self.sg100_dof_needed = config_kuavo_env.sg100_dof_needed
+        self.sg100_dof_offset = config_kuavo_env.sg100_dof_offset
+        self.sg100_open_pose = np.asarray(config_kuavo_env.sg100_open_pose, dtype=np.float64)
+        self.sg100_close_pose = np.asarray(config_kuavo_env.sg100_close_pose, dtype=np.float64)
+        self.sg100_init_pose = np.asarray(config_kuavo_env.sg100_init_pose, dtype=np.float64)
+        self.sg100_force_threshold = config_kuavo_env.sg100_force_threshold
+        self.sg100_force_kp = np.asarray(config_kuavo_env.sg100_force_kp, dtype=np.float64)
+        self.sg100_force_kd = np.asarray(config_kuavo_env.sg100_force_kd, dtype=np.float64)
+        self.sg100_force_torque_ff = np.asarray(config_kuavo_env.sg100_force_torque_ff, dtype=np.float64)
+        self.sg100_force_output_limit = np.asarray(config_kuavo_env.sg100_force_output_limit, dtype=np.float64)
+        self.sg100_force_velocities = np.asarray(config_kuavo_env.sg100_force_velocities, dtype=np.float64)
+        self.is_binary_sg100_action = config_kuavo_env.is_binary_sg100_action
+        self.sg100_action_threshold = config_kuavo_env.sg100_action_threshold
         self.control_rate_hz = getattr(config_kuavo_env, "control_rate", 100)
         self.enable_action_interpolation = getattr(config_kuavo_env, "enable_action_interpolation", True)
         self.interpolation_steps = (
@@ -66,7 +114,7 @@ class KuavoBaseRosEnv(gym.Env):
 
         self.is_binary = config_kuavo_env.is_binary
         self.head_init = config_kuavo_env.head_init
-        self.arm_init = np.array([0]*14)
+        self.arm_init = np.zeros(self.arm_dof, dtype=np.float64)
 
 
         # 从配置中获取limits部分
@@ -89,6 +137,43 @@ class KuavoBaseRosEnv(gym.Env):
                 f"interpolation_steps={self.interpolation_steps}"
             )
 
+    @property
+    def _controlled_sides(self):
+        return ("left", "right") if self.which_arm == "both" else (self.which_arm,)
+
+    def _split_action(self, action):
+        """Split the configured packed action without fixed 8D/16D offsets."""
+        action = np.asarray(action)
+        components = {}
+        offset = 0
+        for side in self._controlled_sides:
+            joint_end = offset + self.arm_dof_per_side
+            eef_end = joint_end + self.eef_dof_per_side
+            components[side] = {
+                "joints": action[offset:joint_end],
+                "eef": action[joint_end:eef_end],
+                "eef_slice": slice(joint_end, eef_end),
+            }
+            offset = eef_end
+        if self.use_5w_wholebody:
+            lower_dof = len(self.limits["lower_body"]["min"])
+            lower_end = offset + lower_dof
+            components["lower_body"] = action[offset:lower_end]
+            offset = lower_end
+        else:
+            components["lower_body"] = np.array([])
+        if self.use_5w_base_move:
+            base_end = offset + BASE_VELOCITY_DOF
+            components["base_velocity"] = action[offset:base_end]
+        else:
+            components["base_velocity"] = np.array([])
+        return components
+
+    def _full_arm_target(self, components):
+        left = components.get("left", {}).get("joints", self.arm_init[:self.arm_dof_per_side])
+        right = components.get("right", {}).get("joints", self.arm_init[self.arm_dof_per_side:])
+        return np.concatenate((left, right), axis=0)
+
     def _set_observation_space(self):
         limits = self.limits
         obs_low, obs_high = [], []
@@ -102,15 +187,18 @@ class KuavoBaseRosEnv(gym.Env):
             grip_min, grip_max = limits['gripper']['min'], limits['gripper']['max']
         else:
             grip_min, grip_max = [], []
-        if self.which_arm == 'both':
-            obs_low.extend(joint_min[:7]+grip_min[:1]+joint_min[7:14]+grip_min[1:2])
-            obs_high.extend(joint_max[:7]+grip_max[:1]+joint_max[7:14]+grip_max[1:2])
-        if self.which_arm == 'left':
-            obs_low.extend(joint_min[:7]+grip_min[:1])
-            obs_high.extend(joint_max[:7]+grip_max[:1])
-        if self.which_arm == 'right':
-            obs_low.extend(joint_min[7:14]+grip_min[1:2])
-            obs_high.extend(joint_max[7:14]+grip_max[1:2])
+        for side_index, side in enumerate(("left", "right")):
+            if side not in self._controlled_sides:
+                continue
+            arm_start = side_index * self.arm_dof_per_side
+            arm_end = arm_start + self.arm_dof_per_side
+            eef_start = side_index * self.eef_dof_per_side
+            eef_end = eef_start + self.eef_dof_per_side
+            obs_low.extend(joint_min[arm_start:arm_end] + grip_min[eef_start:eef_end])
+            obs_high.extend(joint_max[arm_start:arm_end] + grip_max[eef_start:eef_end])
+        if self.use_5w_wholebody:
+            obs_low.extend(limits['lower_body']['min'])
+            obs_high.extend(limits['lower_body']['max'])
 
         self.obs_low = np.array(obs_low)
         self.obs_high = np.array(obs_high)
@@ -142,63 +230,26 @@ class KuavoBaseRosEnv(gym.Env):
 
     def _set_action_space(self):
         limits = self.limits
-
-        # ===============================
-        # 辅助函数：构造单臂动作范围
-        # ===============================
-        def get_arm_action_range(arm: str):
-            """返回 (low, high)"""
-            if self.control_mode == 'joint':
-                if arm == 'left':
-                    return (
-                        limits['joint_q']['min'][:7] + limits['gripper']['min'][:1],
-                        limits['joint_q']['max'][:7] + limits['gripper']['max'][:1],
-                    )
-                elif arm == 'right':
-                    return (
-                        limits['joint_q']['min'][7:14] + limits['gripper']['min'][1:2],
-                        limits['joint_q']['max'][7:14] + limits['gripper']['max'][1:2],
-                    )
-                elif arm == 'both':
-                    return (
-                        limits['joint_q']['min'][:7] + limits['gripper']['min'][:1]+limits['joint_q']['min'][7:14] + limits['gripper']['min'][1:2],
-                        limits['joint_q']['max'][:7] + limits['gripper']['max'][:1]+limits['joint_q']['max'][7:14] + limits['gripper']['max'][1:2],
-                    )
-
-            elif self.control_mode == 'eef':
-                # key = 'eef_relative' if self.use_delta else 'eef'
-                key = 'eef'
-                inf_pad = [-np.inf] * 6
-                inf_pad_pos = [np.inf] * 6
-
-                def eef_block(start, end, grip_idx):
-                    low = limits[key]['min'][start:end] + inf_pad + limits['gripper']['min'][grip_idx:grip_idx + 1]
-                    high = limits[key]['max'][start:end] + inf_pad_pos + limits['gripper']['max'][grip_idx:grip_idx + 1]
-                    return low, high
-
-                if arm == 'left':
-                    return eef_block(0, 3, 0)
-                elif arm == 'right':
-                    return eef_block(6, 9, 1)
-                elif arm == 'both':
-                    low1, high1 = eef_block(0, 3, 0)
-                    low2, high2 = eef_block(6, 9, 1)
-                    return low1 + low2, high1 + high2
-
-            raise ValueError(f"Unsupported arm mode: {arm}")
-
-        # ===============================
-        # 获取臂部动作范围
-        # ===============================
-        arm_low, arm_high = get_arm_action_range(self.which_arm)
-
-        # ===============================
-        # 如果包含 base 控制，则拼接 base 范围
-        # ===============================
-        if not self.only_arm:
-            base_low, base_high = limits['base']['min'], limits['base']['max']
-            arm_low += base_low
-            arm_high += base_high
+        if self.control_mode != 'joint':
+            raise ValueError(f"Unsupported control mode: {self.control_mode}")
+        arm_low, arm_high = [], []
+        for side_index, side in enumerate(("left", "right")):
+            if side not in self._controlled_sides:
+                continue
+            arm_start = side_index * self.arm_dof_per_side
+            arm_end = arm_start + self.arm_dof_per_side
+            eef_start = side_index * self.eef_dof_per_side
+            eef_end = eef_start + self.eef_dof_per_side
+            arm_low.extend(limits['joint_q']['min'][arm_start:arm_end] + limits['gripper']['min'][eef_start:eef_end])
+            arm_high.extend(limits['joint_q']['max'][arm_start:arm_end] + limits['gripper']['max'][eef_start:eef_end])
+        if self.use_5w_wholebody:
+            arm_low.extend(limits['lower_body']['min'])
+            arm_high.extend(limits['lower_body']['max'])
+        if self.use_5w_base_move:
+            # No project-level velocity limits are configured. Preserve model
+            # outputs here; safe limits should be enforced by the base controller.
+            arm_low.extend([-np.inf] * BASE_VELOCITY_DOF)
+            arm_high.extend([np.inf] * BASE_VELOCITY_DOF)
 
         # ===============================
         # 创建 Gym Box 空间
@@ -228,12 +279,19 @@ class KuavoBaseRosEnv(gym.Env):
             self.lejuclaw = LejuClaw()
         elif self.eef_type == 'qiangnao':
             self.qiangnao = DexterousHand()
+        elif self.eef_type == 'sg100':
+            self.sg100 = SG100Hand(ros_manager=self.ros_manager)
+        if self.use_5w_base_move:
+            self.cmd_vel_pub = self.ros_manager.register_publisher(
+                '/cmd_vel', Twist, queue_size=10
+            )
         # obs buffer 初始化            
         self.obs_buffer.wait_buffer_ready()
 
 
     def reset(self, **kwargs):
         """重置机器人状态"""
+        self.stop_base()
         self._enter_external_control_mode()
         self._reset_head()
         self._reset_eef()
@@ -332,16 +390,22 @@ class KuavoBaseRosEnv(gym.Env):
                 self.qiangnao.control(target_positions=[0, 100, 0, 0, 0, 0, 0, 100, 0, 0, 0, 0], target_velocities=None, target_torques=None)
             elif self.eef_type == 'leju_claw':
                 self.lejuclaw.control(target_positions=[0, 0], target_velocities=None, target_torques=None)
+            elif self.eef_type == 'sg100':
+                self.sg100.control(self.sg100_init_pose.tolist())
         elif self.which_arm == 'left':
             if self.eef_type == 'qiangnao':
                 self.qiangnao.control_left(target_positions=[0, 100, 0, 0, 0, 0], target_velocities=None, target_torques=None)
             elif self.eef_type == 'leju_claw':
                 self.lejuclaw.control_left(target_positions=[0], target_velocities=None, target_torques=None)
+            elif self.eef_type == 'sg100':
+                self.sg100.control_left(self.sg100_init_pose[:11].tolist())
         elif self.which_arm == 'right':
             if self.eef_type == 'qiangnao':
                 self.qiangnao.control_right(target_positions=[0, 100, 0, 0, 0, 0], target_velocities=None, target_torques=None)
             elif self.eef_type == 'leju_claw':
                 self.lejuclaw.control_right(target_positions=[0], target_velocities=None, target_torques=None)
+            elif self.eef_type == 'sg100':
+                self.sg100.control_right(self.sg100_init_pose[11:].tolist())
         else:
             raise KeyError(f"Unsupported arm type: {self.which_arm}")
 
@@ -376,18 +440,12 @@ class KuavoBaseRosEnv(gym.Env):
     # 子函数 5. 构造完整 FK 输入
     # ==========================================================
     def _get_init_joint_angles(self, joint_q):
-        # if self.which_arm == 'both':
-        #     if self.fk_joint_angles_for_reset is not None:
-        #         fk_joint_angles = np.array(self.fk_joint_angles_for_reset) / 180 * np.pi
-        #     else:
-        #         fk_joint_angles = np.array([-10, 15, 25, -85, -90, 15, -20,   50, 0, 0, -140, 90, 0, 0])/180*np.pi
-        #     return fk_joint_angles
         if self.which_arm == 'both':
             return np.array(joint_q)
         elif self.which_arm == 'left':
-            return np.concatenate((joint_q, self.arm_init[7:14]))
+            return np.concatenate((joint_q, self.arm_init[self.arm_dof_per_side:]))
         elif self.which_arm == 'right':
-            return np.concatenate((self.arm_init[:7], joint_q))
+            return np.concatenate((self.arm_init[:self.arm_dof_per_side], joint_q))
         else:
             raise ValueError(f"Invalid which_arm: {self.which_arm}")
     
@@ -413,38 +471,12 @@ class KuavoBaseRosEnv(gym.Env):
         t1 = time.time()
         log_robot.info(f"clip action: {action}, check time: {t1 - t0:.3f}s")
 
-        if not self.only_arm:
-            # 获取action中base移动相关的部分（最后4个值），最后一位用于判断是移动还是手部动作
-            base_action = action[-4:]
-            move_flag = base_action[-1]  # 0-1之间的值，用于判断是否执行base移动
-            if move_flag > 0.5:  # 如果大于0.5，执行base移动
-                # 执行base移动，这里需要调用相关的base移动接口
-                log_robot.info(f"➡️  执行【底盘移动】(mode_flag > 0.5)")
-                log_robot.info(f"cmd_pos_world = [x:{base_action[0]:.4f}, y:{base_action[1]:.4f}, yaw:{base_action[2]:.4f}], move_flag={move_flag:.4f}")
-                self.robot.control_command_pose_world(base_action[0], base_action[1], 0, base_action[2])
-                self.rate.sleep()
-                self._record_sleep_time(t1)
-                return self.get_obs(), 0, False, False, {}
-            else:
-                log_robot.info(f"机器人是否处于站立状态：{self.robot._kuavo_core.state},(mode_flag < 0.5)")
-                if self.robot._kuavo_core.state != 'stance':
-                    self.robot.stance()
-                    self.robot_state.wait_for_stance()
-                    log_robot.info(f"➡️  执行【机器人站立】成功! (mode_flag < 0.5)")
-            # 如果不执行base移动，则执行手部动作，此时使用action的前面部分
-            action = action[:-4]
 
 
         # === 4. 执行动作 ===
         t2 = time.time()
-        if self.which_arm == 'both':
-            self.cur_joint_angles_action = np.concatenate((action[:7], action[8:15]), axis=0)
-        elif self.which_arm == 'left':
-            self.cur_joint_angles_action = np.concatenate((action[:7], self.arm_init[7:14]), axis=0)
-        elif self.which_arm == 'right':
-            self.cur_joint_angles_action = np.concatenate((self.arm_init[:7], action[:7]), axis=0)
-        else:
-            raise ValueError(f"Invalid which_arm: {self.which_arm}")
+        action_components = self._split_action(action)
+        self.cur_joint_angles_action = self._full_arm_target(action_components)
 
         if not self.direct_to_wbc:
             self.exec_action(action)
@@ -452,8 +484,7 @@ class KuavoBaseRosEnv(gym.Env):
         else:
             # ==== 4.1 插值下发动作（direct_to_wbc 路径）
             # 第一帧从 current state 插值过去；之后每帧在 last_predicted_action -> action 之间插值。
-            # 关键：插值维度等于 action 维度（both=16，left/right=8），
-            # 下发到 WBC 时再补成 14 维双臂关节。单臂模式下非控制臂使用 arm_init 零位。
+            # Interpolate according to the configured packed action layout.
 
             current_q = self._get_init_joint_angles(self.arm_state["joint_q"])
             num_inter_points = self.interpolation_steps
@@ -461,18 +492,19 @@ class KuavoBaseRosEnv(gym.Env):
             if self.is_first_step:
                 self.is_first_step = False
 
-                # 构造目标 14 维关节（仅关节，不含夹爪），用于第一帧从 current_q 平滑过去
-                if self.which_arm == 'both':
-                    target_joints14 = np.concatenate((action[:7], action[8:15]), axis=0)
-                elif self.which_arm == 'left':
-                    target_joints14 = np.concatenate((action[:7], self.arm_init[7:14]), axis=0)
-                else:  # right
-                    target_joints14 = np.concatenate((self.arm_init[:7], action[:7]), axis=0)
+                target_joints = self._full_arm_target(action_components)
+                current_lower = np.asarray(self.arm_state.get("lower_body", []), dtype=float)
+                target_lower = action_components["lower_body"]
 
                 for i in range(num_inter_points):
                     alpha = (i + 1) / num_inter_points
-                    inter_joints14 = (1 - alpha) * current_q + alpha * target_joints14
-                    self.safe_control_arm(inter_joints14)
+                    inter_joints = (1 - alpha) * current_q + alpha * target_joints
+                    self.safe_control_arm(inter_joints)
+                    if self.use_5w_wholebody:
+                        inter_lower = (1 - alpha) * current_lower + alpha * target_lower
+                        self.safe_control_lower_body(inter_lower)
+                    if self.use_5w_base_move:
+                        self.safe_control_base(alpha * action_components["base_velocity"])
                     self.control_rate.sleep()
 
                 self.exec_action(action)
@@ -483,26 +515,18 @@ class KuavoBaseRosEnv(gym.Env):
                 if self.last_predicted_action is None:
                     self.last_predicted_action = action.copy()
 
-                # 夹爪目标值（不参与插值）：每个分支只声明自己真正会用到的那个
-                if self.which_arm == 'both':
-                    left_eef = action[7]
-                    right_eef = action[15]
-                elif self.which_arm == 'left':
-                    left_eef = action[7]
-                else:  # right
-                    right_eef = action[7]
+                eef_targets = [
+                    component["eef_slice"]
+                    for side, component in action_components.items()
+                    if side in ("left", "right")
+                ]
 
                 for i in range(num_inter_points):
                     alpha = (i + 1) / num_inter_points
                     inter_arm_action = (1 - alpha) * self.last_predicted_action + alpha * action
-                    # 夹爪不参与插值，直接锁到目标值
-                    if self.which_arm == 'both':
-                        inter_arm_action[7] = left_eef
-                        inter_arm_action[15] = right_eef
-                    elif self.which_arm == 'left':
-                        inter_arm_action[7] = left_eef
-                    else:  # right
-                        inter_arm_action[7] = right_eef
+                    # End effectors retain the current target instead of interpolation.
+                    for eef_slice in eef_targets:
+                        inter_arm_action[eef_slice] = action[eef_slice]
 
                     self.exec_action(inter_arm_action)
                     self.control_rate.sleep()
@@ -538,62 +562,134 @@ class KuavoBaseRosEnv(gym.Env):
             else:
                 raise
 
+    def safe_control_lower_body(self, target_position):
+        """Send model-space radians through the SDK's degree-based 5W API."""
+        if self.lower_body_lock_target is not None:
+            target_position = np.asarray(target_position, dtype=float).copy()
+            target_position[self.lower_body_lock_mask] = self.lower_body_lock_target[
+                self.lower_body_lock_mask
+            ]
+        try:
+            self.robot.control_wheel_lower_joint(np.rad2deg(target_position).tolist())
+        except RuntimeError as e:
+            if "must be in stance state" in str(e):
+                log_robot.warning("Unable to send 5W lower-body command in the current robot state")
+            else:
+                raise
+
+    def safe_control_base(self, velocity):
+        """Publish model-space [vx, vy, vyaw] to geometry_msgs/Twist."""
+        velocity = np.asarray(velocity, dtype=float).reshape(-1)
+        if velocity.size != BASE_VELOCITY_DOF or not np.isfinite(velocity).all():
+            raise ValueError(
+                f"Base velocity must contain {BASE_VELOCITY_DOF} finite values "
+                f"[vx, vy, vyaw], got {velocity}"
+            )
+        msg = Twist()
+        msg.linear.x = float(velocity[0])
+        msg.linear.y = float(velocity[1])
+        msg.linear.z = 0.0
+        msg.angular.x = 0.0
+        msg.angular.y = 0.0
+        msg.angular.z = float(velocity[2])
+        self.cmd_vel_pub.publish(msg)
+
+    def stop_base(self):
+        """Publish a zero Twist when base control is active."""
+        if getattr(self, 'use_5w_base_move', False) and hasattr(self, 'cmd_vel_pub'):
+            self.safe_control_base(np.zeros(BASE_VELOCITY_DOF, dtype=float))
+
     def exec_action(self, action):
         """执行机械臂与末端执行器动作"""
-        # if not self.only_arm:
-        #     return
-
         if self.direct_to_wbc:
             action = self.low_pass_filter.update(action)
-        if self.which_arm == 'both':
-            left_joints, left_eef = action[:7], action[7]
-            right_joints, right_eef = action[8:15], action[15]
-            target_position = np.concatenate((left_joints, right_joints), axis=0)
-            self.safe_control_arm(target_position)
-            self._control_eef(left_eef, right_eef)
-
-        elif self.which_arm == 'left':
-            left_joints, left_eef = action[:7], action[7]
-            target_position = np.concatenate((left_joints, self.arm_init[7:14]), axis=0)
-            self.safe_control_arm(target_position)
-            self._control_eef(left_eef, 0)
-
-        elif self.which_arm == 'right':
-            right_joints, right_eef = action[:7], action[7]
-            target_position = np.concatenate((self.arm_init[:7], right_joints), axis=0)
-            self.safe_control_arm(target_position)
-            self._control_eef(0, right_eef)
-        else:
-            raise KeyError(f"Unsupported which_arm: {self.which_arm}")
+        components = self._split_action(action)
+        target_position = self._full_arm_target(components)
+        self.safe_control_arm(target_position)
+        empty_eef = np.zeros(self.eef_dof_per_side, dtype=float)
+        left_eef = components.get("left", {}).get("eef", empty_eef)
+        right_eef = components.get("right", {}).get("eef", empty_eef)
+        self._control_eef(left_eef, right_eef)
+        if self.use_5w_wholebody:
+            self.safe_control_lower_body(components["lower_body"])
+        if self.use_5w_base_move:
+            self.safe_control_base(components["base_velocity"])
 
 
 
     def _control_eef(self, left_eef, right_eef):
         """根据 eef_type 控制不同的末端执行器"""
+        left_eef = np.asarray(left_eef, dtype=float).reshape(-1)
+        right_eef = np.asarray(right_eef, dtype=float).reshape(-1)
         if self.eef_type == 'rq2f85':
             eef_msg = JointState()
             try:
                 eef_msg.name = ['left_gripper_joint', 'right_gripper_joint']
             except Exception as e:
                 log_robot.info(f"_control_eef error! {e}")
-            eef_msg.position = np.array([left_eef * 255, right_eef * 255])
+            eef_msg.position = np.concatenate((left_eef, right_eef)) * 255
             self.pub_eef_joint.publish(eef_msg)
 
         elif self.eef_type == 'leju_claw':
             eef_msg = JointState()
-            eef_msg.position = np.array([left_eef * 100, right_eef * 100])
+            eef_msg.position = np.concatenate((left_eef, right_eef)) * 100
             self.lejuclaw.control(target_positions=eef_msg.position)
 
         elif self.eef_type == 'qiangnao':
             if self.qiangnao_dof_needed != 1:
                 raise KeyError("qiangnao_dof_needed != 1 is not supported!")
 
-            tem_left, tem_right = left_eef * 100, right_eef * 100
+            tem_left, tem_right = left_eef.item() * 100, right_eef.item() * 100
             target_positions = np.array([
                 tem_left, 100, *([tem_left] * 4),
                 tem_right, 100, *([tem_right] * 4)
             ])
             self.qiangnao.control(target_positions=target_positions)
+
+        elif self.eef_type == 'sg100':
+            left_eef = np.asarray(left_eef, dtype=np.float64).reshape(-1)
+            right_eef = np.asarray(right_eef, dtype=np.float64).reshape(-1)
+            if self.is_binary_sg100_action:
+                left_eef = (left_eef > self.sg100_action_threshold).astype(np.float64)
+                right_eef = (right_eef > self.sg100_action_threshold).astype(np.float64)
+
+            def _expand(values: np.ndarray, hand_slice: slice):
+                if values.size == 1:
+                    # The single-DOF representation is a normalized open/close
+                    # amount, so it must stay within [0, 1].
+                    amount = float(np.clip(values[0], 0.0, 1.0))
+                    positions = (
+                        self.sg100_open_pose[hand_slice] * (1.0 - amount)
+                        + self.sg100_close_pose[hand_slice] * amount
+                    )
+                    mode = (SG100HandCommand.MODE_JOINT_IMPEDANCE
+                            if amount > self.sg100_force_threshold
+                            else SG100HandCommand.MODE_JOINT_POSITION)
+                    modes = [mode] * 11
+                elif values.size == 11:
+                    # Full-hand datasets store each raw joint angle divided by
+                    # 1.57. Some SG100 joints legitimately use negative values
+                    # (for example right thumb_j2), so do not apply the scalar
+                    # open/close clipping here.
+                    positions = values * 1.57
+                    modes = [SG100HandCommand.MODE_JOINT_POSITION] * 11
+                else:
+                    raise ValueError(f"SG100 action must have 1 or 11 values per hand, got {values.size}")
+                return positions.tolist(), modes
+
+            left_positions, left_modes = _expand(left_eef, slice(0, 11))
+            right_positions, right_modes = _expand(right_eef, slice(11, 22))
+            self.sg100.control(
+                target_positions=left_positions + right_positions,
+                control_modes=left_modes + right_modes,
+                kp=self.sg100_force_kp.tolist(),
+                kd=self.sg100_force_kd.tolist(),
+                torque_ff=self.sg100_force_torque_ff.tolist(),
+                output_limit=self.sg100_force_output_limit.tolist(),
+                target_velocities=self.sg100_force_velocities.tolist(),
+                enable_left=self.which_arm in ('left', 'both'),
+                enable_right=self.which_arm in ('right', 'both'),
+            )
 
         else:
             raise KeyError(f"Unsupported eef_type: {self.eef_type}")
@@ -628,7 +724,7 @@ class KuavoBaseRosEnv(gym.Env):
 
         assert len(self.arm_state.keys()) >= 2, f"arm_state must have exactly 2 elements, but got {len(self.arm_state.keys())}"
 
-        state_keys = [k for k in self.arm_state_keys if k in self.arm_state]
+        state_keys = [k for k in self.arm_state_keys if k in self.arm_state and k != "lower_body"]
 
         arm_data = { "left": [], "right": [] }
 
@@ -648,9 +744,10 @@ class KuavoBaseRosEnv(gym.Env):
                 raise KeyError(f"Unsupported which_arm: {self.which_arm}")
 
         # 拼接结果
-        obs["observation.state"] = np.concatenate(
-            arm_data["left"] + arm_data["right"], axis=0
-        )
+        state_parts = arm_data["left"] + arm_data["right"]
+        if self.use_5w_wholebody:
+            state_parts.append(np.asarray(self.arm_state["lower_body"]))
+        obs["observation.state"] = np.concatenate(state_parts, axis=0)
         log_robot.info(f"STATE: contained {state_keys}, concated value: {obs['observation.state']}")
 
         obs["observation.state"] = torch.from_numpy(obs["observation.state"]).float().unsqueeze(0)
@@ -660,6 +757,7 @@ class KuavoBaseRosEnv(gym.Env):
         """关闭环境，释放资源"""
         log_robot.info("Closing KuavoBaseRosEnv...")
         try:
+            self.stop_base()
             if hasattr(self, 'obs_buffer'):
                 self.obs_buffer.stop_subscribers()
                 if hasattr(self.obs_buffer, 'obs_buffer_data'):
@@ -753,6 +851,88 @@ class LejuClaw:
         """释放资源"""
         if hasattr(self, 'ros_manager'):
             self.ros_manager.close()
+
+
+class SG100Hand:
+    """Publisher for the repository-local SG100 ROS command message."""
+
+    JOINTS_PER_HAND = 11
+    ALL_JOINTS_MASK = 0x07FF
+
+    def __init__(self, ros_manager=None):
+        self.ros_manager = ros_manager or ROSManager()
+        self._pub = self.ros_manager.register_publisher(
+            '/sg100_hand_command', SG100HandCommand, queue_size=10
+        )
+
+    @staticmethod
+    def _optional_22(name, values):
+        if values is None:
+            return None
+        if len(values) != 22:
+            raise ValueError(f"{name} must contain 22 values, got {len(values)}")
+        return list(values)
+
+    def control(
+        self,
+        target_positions,
+        control_modes=None,
+        kp=None,
+        kd=None,
+        torque_ff=None,
+        output_limit=None,
+        target_velocities=None,
+        *,
+        enable_left=True,
+        enable_right=True,
+    ):
+        if len(target_positions) != 22:
+            raise ValueError(f"target_positions must contain 22 values, got {len(target_positions)}")
+
+        control_modes = self._optional_22("control_modes", control_modes)
+        kp = self._optional_22("kp", kp)
+        kd = self._optional_22("kd", kd)
+        torque_ff = self._optional_22("torque_ff", torque_ff)
+        output_limit = self._optional_22("output_limit", output_limit)
+        target_velocities = self._optional_22("target_velocities", target_velocities)
+
+        cmd = SG100HandCommand()
+        cmd.header.stamp = rospy.Time.now()
+        positions = [float(np.clip(value, -5, 5)) for value in target_positions]
+        cmd.left_hand_positions = positions[:11]
+        cmd.right_hand_positions = positions[11:]
+        cmd.left_enable_mask = self.ALL_JOINTS_MASK if enable_left else 0
+        cmd.right_enable_mask = self.ALL_JOINTS_MASK if enable_right else 0
+
+        if control_modes is None:
+            cmd.control_mode = SG100HandCommand.MODE_JOINT_POSITION
+        else:
+            cmd.control_mode = int(control_modes[0])
+            cmd.left_hand_control_mode = [int(value) for value in control_modes[:11]]
+            cmd.right_hand_control_mode = [int(value) for value in control_modes[11:]]
+
+        for values, left_name, right_name in (
+            (target_velocities, "left_hand_velocities", "right_hand_velocities"),
+            (kp, "left_hand_kp", "right_hand_kp"),
+            (kd, "left_hand_kd", "right_hand_kd"),
+            (torque_ff, "left_hand_torque_ff", "right_hand_torque_ff"),
+            (output_limit, "left_hand_output_limit", "right_hand_output_limit"),
+        ):
+            if values is not None:
+                setattr(cmd, left_name, [float(value) for value in values[:11]])
+                setattr(cmd, right_name, [float(value) for value in values[11:]])
+
+        self._pub.publish(cmd)
+
+    def control_left(self, target_positions):
+        if len(target_positions) != 11:
+            raise ValueError("SG100 left-hand command must contain 11 values")
+        self.control(list(target_positions) + [0.0] * 11, enable_left=True, enable_right=False)
+
+    def control_right(self, target_positions):
+        if len(target_positions) != 11:
+            raise ValueError("SG100 right-hand command must contain 11 values")
+        self.control([0.0] * 11 + list(target_positions), enable_left=False, enable_right=True)
 
 # 使用示例
 if __name__ == "__main__":

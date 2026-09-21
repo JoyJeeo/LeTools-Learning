@@ -1,0 +1,35 @@
+{
+  "state": {
+    "right_arm": {
+      "start": 0,
+      "end": 7
+    },
+    "right_sg100": {
+      "start": 7,
+      "end": 18
+    }
+  },
+  "action": {
+    "right_arm": {
+      "start": 0,
+      "end": 7
+    },
+    "right_sg100": {
+      "start": 7,
+      "end": 18
+    }
+  },
+  "video": {
+    "head": {
+      "original_key": "observation.images.head_cam_h"
+    },
+    "wrist_right": {
+      "original_key": "observation.images.wrist_cam_r"
+    }
+  },
+  "annotation": {
+    "human.task_description": {
+      "original_key": "task_index"
+    }
+  }
+}

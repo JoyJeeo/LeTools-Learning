@@ -15,7 +15,9 @@ from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import sensorsData,lejuClawState
 from kuavo_deploy.utils.signal_controller import ControlSignalManager
 from kuavo_deploy.utils.logging_utils import setup_logger
 from kuavo_deploy.utils.ros_manager import ROSManager
+from kuavo_deploy.utils.h265_decoder import RealtimeH265Decoder
 from kuavo_data.common.config_platform import get_arm_joint_slice
+from kuavo_deploy.utils.sg100_msgs import SG100HandState
 
 log_robot = setup_logger("robot")
 
@@ -58,6 +60,9 @@ class ObsBuffer:
             for k, v in self.obs_key_map.items()
         }
 
+        # === H265 解码器实例 (每个相机一个，有状态) ===
+        self._h265_decoders: Dict[str, RealtimeH265Decoder] = {}
+
         # === ROS topic 对应表 ===
         self.callback_key_map = {
             '/cam_h/color/image_raw/compressed': self.rgb_callback,
@@ -66,10 +71,14 @@ class ObsBuffer:
             '/cam_h/depth/image_raw/compressedDepth': self.depth_callback,
             '/cam_l/depth/image_rect_raw/compressedDepth': self.depth_callback,
             '/cam_r/depth/image_rect_raw/compressedDepth': self.depth_callback,
+            '/cam_h/color/h265_stream': self.h265_color_callback,
+            '/cam_l/color/h265_stream': self.h265_color_callback,
+            '/cam_r/color/h265_stream': self.h265_color_callback,
             '/sensors_data_raw': self.sensorsData_callback,
             '/dexhand/state': self.qiangnaoState_callback,
             '/leju_claw_state': self.lejuClawState_callback,
             '/gripper/state': self.rq2f85State_callback,
+            '/sg100_hand_state': self.sg100State_callback,
         }
         self.setup_subscribers()
 
@@ -82,7 +91,8 @@ class ObsBuffer:
         msg_type_dict = {"CompressedImage":CompressedImage,
                          "sensorsData":sensorsData,
                          "JointState":JointState,
-                         "lejuClawState":lejuClawState}
+                         "lejuClawState":lejuClawState,
+                         "SG100HandState":SG100HandState}
         for topic_key, info in self.subscribe_keys.items():
             topic_name = info["topic"]
             assert info["msg_type"] in msg_type_dict, f"msg_type '{info['msg_type']}' is not supported; valid keys: {list(msg_type_dict.keys())}"
@@ -142,6 +152,21 @@ class ObsBuffer:
         data = self.depth_preprocess(image, depth_range=handle.get("params", {}).get("depth_range", [0, 1500]))
         self._append_data(key, data, msg.header.stamp.to_sec())
 
+    def h265_color_callback(self, msg: CompressedImage, key: str, handle: dict):
+        """Decode one H.265 color access unit from CompressedImage."""
+        decoder = self._h265_decoders.get(key)
+        if decoder is None:
+            resize_wh = handle.get("params", {}).get("resize_wh", [640, 480])
+            decoder = RealtimeH265Decoder(resize_wh[0], resize_wh[1])
+            self._h265_decoders[key] = decoder
+
+        rgb = decoder.decode(bytes(msg.data))
+        if rgb is None:
+            return
+
+        data = self.img_preprocess(rgb)
+        self._append_data(key, data, msg.header.stamp.to_sec())
+
     def sensorsData_callback(self, msg: sensorsData, key: str, handle = dict):
         # Float64Array ()
         joint = msg.joint_data.joint_q
@@ -181,6 +206,16 @@ class ObsBuffer:
         slice_value = handle.get("params", {}).get("slice", None)
         joint = [x for slc in slice_value for x in joint[slc[0]:slc[1]]]
         # joint = torch.tensor(joint, dtype=torch.float32, device=self.device)
+        self._append_data(key, joint, msg.header.stamp.to_sec())
+
+    def sg100State_callback(self, msg: SG100HandState, key: str, handle=dict):
+        joint = list(msg.left_hand_positions) + list(msg.right_hand_positions)
+        if len(joint) != 22:
+            log_robot.warning(f"Discarding SG100 state with {len(joint)} positions; expected 22")
+            return
+        joint = [float(value) / 1.57 for value in joint]
+        slices = handle.get("params", {}).get("slice") or []
+        joint = [value for start, end in slices for value in joint[start:end]]
         self._append_data(key, joint, msg.header.stamp.to_sec())
 
     # ===== 公共方法 =====
@@ -239,7 +274,7 @@ class ObsBuffer:
             obs[k] = list(buf["data"])[-1]  # 取最新一帧
         return obs
 
-    def get_aligned_obs(self, reference_keys=["/cam_h/color/image_raw/compressed"], max_dt=0.01, ratio=1.0):
+    def get_aligned_obs(self, reference_keys=None, max_dt=0.01, ratio=1.0):
         """
         返回各观测时间上对齐的最新帧
         reference_keys: 以哪些key作为时间参考，默认 None -> 所有 key 最小的最新时间戳
@@ -286,4 +321,3 @@ class ObsBuffer:
                 aligned_obs[k] = data[idx]
 
         return aligned_obs
-

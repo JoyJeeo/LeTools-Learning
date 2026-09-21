@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS>
+    <Domain Id="any">
+        <General>
+            <Interfaces>
+                <NetworkInterface name="eno1" multicast="true" />
+            </Interfaces>
+            <AllowMulticast>true</AllowMulticast>
+        </General>
+        <Discovery>
+            <EnableTopicDiscoveryEndpoints>true</EnableTopicDiscoveryEndpoints>
+            <Peers>
+                <Peer Address="192.168.26.1" />
+            </Peers>
+        </Discovery>
+    </Domain>
+</CycloneDDS>

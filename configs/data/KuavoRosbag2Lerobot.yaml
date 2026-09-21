@@ -16,14 +16,19 @@ rosbag:
   mode: normal  # 可选: normal, resume, merge
   rosbag_dir: /path/to/rosbags # rosbag文件存放的目录。normal / resume 模式需要
   target_dir: /path/to/target_dir  # 输出父目录；最终数据集会生成在 target_dir/lerobot
+  chunk_size: 100  # 分块流式处理每批帧数防止OOM，如果内存不足，可以适当减小该值（可选，默认 100）
   lerobot_dir_resume: /path/to/lerobot_resume  # resume 模式下，已有 lerobot 数据集的目录
   lerobot_dir_merge: 
     ["/path/to/lerobot1",
     "/path/to/lerobot2"]  # merge 模式下，要合并的多个 lerobot 数据集目录列表
+  parallel: false  # true 时 rosbag 数据分片并行转换,可加速数据转换，但需要更多内存，仅 normal 模式生效
+  parallel_workers: 4  # 并行进程数，建议使用4，若内存不足，可以适当减小该值
 
 dataset:
   platform_type: "4pro"  # 硬件平台类型，可选: "4pro", "5w" 或 "5"，默认使用 configs/platform/platform_config.yaml 中的 default 值，比赛默认4pro
-  eef_type: leju_claw # 末端执行器类型，仿真选择：rq2f85, 真机可选：leju_claw,（夹爪） qiangnao，（灵巧手）
+  5w_wholebody: false  # 仅 platform_type=5w 时生效；追加4维下半身 state/action
+  5w_base_move: false  # 仅 platform_type=5w 时生效；在 action 末尾追加 /cmd_vel 的 [vx, vy, vyaw]
+  eef_type: leju_claw # 末端执行器类型，仿真选择：rq2f85, 真机可选：leju_claw（夹爪）、qiangnao、sg100（灵巧手）
   which_arm: both  # 需要哪一只手臂的关节 + 图像数据，可选: left, right, both，注意图像数据会同时包含头部相机图像
  
   task_description: "Pick and Place" # 任务描述，自定义
@@ -32,6 +37,11 @@ dataset:
   main_timeline: head_cam_h # 将哪个相机设为主相机，默认主相机来自：head_cam_h, 可选：wrist_cam_l, wrist_cam_r
   main_timeline_fps: 30 # 主相机的帧率，必须稳定，默认30帧
   sample_drop: 10 # 丢弃episode前后的10帧
+
+  # 灵巧手每只手保留的模型自由度。SG100 仅支持 1（开合标量）或 11（全关节）。
+  dex_dof_needed: 11
+  # 0=从第1个关节开始，8=从第9个关节(sg100_9)开始；SG100 dof=11 时必须为 0。
+  dex_dof_offset: 0
 
   resize:
     width: 848  # 图像缩放宽度，注意请先查看（推荐浏览器foxglove工具）rosbag中图像的原始尺寸，避免放大或缩小带来模糊或拉伸形变等问题

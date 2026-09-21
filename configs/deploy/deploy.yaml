@@ -14,9 +14,9 @@ env:  # 推理环境设置
 inference:  # 推理和评测设置
   go_bag_path: null    # bag 回放路径
   policy_type: act  # 要加载的模型类型,外挂模式选择client, 选择client模式后下面的pretrained_path失去作用
-  pretrained_path: /home/zhangyutao/yuto/codes/work/LeTools-Learning/outputs/train/act_20260917_232139/checkpoints/050000/pretrained_model  # 要加载的权重路径。
+  pretrained_path: /home/zhangyutao/yuto/codes/work/LeTools-Learning/outputs/train/act_20260917_232139/checkpoints/500000/pretrained_model  # 要加载的权重路径。
   eval_episodes: 10  # 评测跑多少条
-  max_episode_steps: 200  # 每条最多跑多少步
+  max_episode_steps: 2000  # 每条最多跑多少步
   task_prompt: "Pick and Place"
 
   async_inference: false
